@@ -19,7 +19,7 @@ def main():
                                       "What kinds of users use CML?",
                                       "How do data scientists use CML?",
                                       "What are iceberg tables?"],
-                            allow_flagging="never")
+                            flagging_mode="never")
 
 
     # Launch gradio app
