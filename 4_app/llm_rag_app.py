@@ -81,8 +81,15 @@ def get_nearest_chunk_from_vectordb(vector_db_collection, question):
   
 # Return the Knowledge Base doc based on Knowledge Base ID (relative file path)
 def load_context_chunk_from_data(id_path):
-    with open(id_path, "r") as f: # Open file in read mode
-        return f.read()
+    if id_path.endswith('.pdf'):
+        from pdfminer.high_level import extract_text
+        text = extract_text(id_path)
+    else:
+        with open(id_path, "r", errors='ignore') as f:
+            text = f.read()
+    text = text.encode('utf-8', errors='ignore').decode('utf-8')
+    # Truncar a ~512 tokens (~2000 caracteres) para no reventar la GPU
+    return text[:2000]
       
 def create_enhanced_prompt(context, question):
     prompt_template = """<human>:%s. Answer this question based on given context %s
