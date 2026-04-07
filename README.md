@@ -105,6 +105,8 @@ Definition of the job **Populate Vector DB with documents embeddings**
 - The embeddings vector for each document is inserted into the vector database
 - Stop the vector database
 
+- There is a new script labeled **load_custom_docs.py** that will allow you to insert PDF files as well
+
 ### `4_app`
 Definition of the application `CML LLM Chatbot`
 - Start the milvus vector database using persisted database data in milvus-data/
