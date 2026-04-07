@@ -20,25 +20,24 @@ def main():
         doc_dir = './data'
         count = 0
 
-        # Cargar TXTs
-        for file in Path(doc_dir).glob('**/*.txt'):
-            with open(file, "r") as f:
-                print(f"Embedding: {file.name}")
-                insert_embedding(collection, os.path.abspath(file), f.read())
+        # Cargar archivos TXT originales
+        for txt_file in Path(doc_dir).glob('**/*.txt'):
+            with open(txt_file, 'r') as fh:
+                print(f'Embedding TXT: {txt_file.name}')
+                insert_embedding(
+                    collection, str(txt_file.absolute()), fh.read()
+                )
                 count += 1
 
-        # Cargar PDFs
         # Cargar archivos PDF custom
-        for file in Path(doc_dir).glob('**/*.pdf'):
-            print(f'Embedding PDF: {f.name}')
-            text = extract_text(str(f))
-            # Limpiar caracteres no-UTF8
+        for pdf_file in Path(doc_dir).glob('**/*.pdf'):
+            print(f'Embedding PDF: {pdf_file.name}')
+            text = extract_text(str(pdf_file))
             text = text.encode('utf-8', errors='ignore').decode('utf-8')
             insert_embedding(
-                collection, os.path.abspath(f), text
+                collection, str(pdf_file.absolute()), text
             )
             count += 1
-
         collection.flush()
         print(f'Total embeddings: {collection.num_entities}')
 
