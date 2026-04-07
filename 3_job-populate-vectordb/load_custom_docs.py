@@ -22,10 +22,12 @@ def main():
 
         # Cargar archivos TXT originales
         for txt_file in Path(doc_dir).glob('**/*.txt'):
-            with open(txt_file, 'r') as fh:
+            with open(txt_file, 'r', errors='ignore') as fh:
                 print(f'Embedding TXT: {txt_file.name}')
+                text = fh.read()
+                text = text.encode('utf-8', errors='ignore').decode('utf-8')
                 insert_embedding(
-                    collection, str(txt_file.absolute()), fh.read()
+                    collection, str(txt_file.absolute()), text
                 )
                 count += 1
 
