@@ -1,5 +1,7 @@
 from milvus import default_server
 from pymilvus import connections, utility
+import sys
+sys.path.insert(0, '/home/cdsw/3_job-populate-vectordb')
 from vectordb_insert import create_milvus_collection, insert_embedding
 from pdfminer.high_level import extract_text
 from pathlib import Path
@@ -26,10 +28,15 @@ def main():
                 count += 1
 
         # Cargar PDFs
+        # Cargar archivos PDF custom
         for file in Path(doc_dir).glob('**/*.pdf'):
-            print(f"Embedding PDF: {file.name}")
-            text = extract_text(str(file))
-            insert_embedding(collection, os.path.abspath(file), text)
+            print(f'Embedding PDF: {f.name}')
+            text = extract_text(str(f))
+            # Limpiar caracteres no-UTF8
+            text = text.encode('utf-8', errors='ignore').decode('utf-8')
+            insert_embedding(
+                collection, os.path.abspath(f), text
+            )
             count += 1
 
         collection.flush()
