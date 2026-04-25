@@ -1,35 +1,65 @@
 """
-llm_rag_app.py — RAG Chatbot con Interfaz Moderna
+llm_rag_app.py — RAG Chatbot v3
 Cloudera Machine Learning
 
-Features:
-  - Upload de documentos (PDF/TXT) directo desde la interfaz
-  - Ingesta automática a Milvus al subir archivos  
-  - Chatbot RAG con visualización de fuentes
-  - Panel de documentos indexados
-  - Branding Cloudera
+Mejoras sobre v2:
+  - Guarda texto limpio y truncado DENTRO de Milvus (no re-lee archivos del disco)
+  - Auto-instala pdfminer.six si no está disponible
+  - Múltiples fallbacks para extracción de PDF
+  - Zero dependencias externas que puedan fallar en runtime
 """
 import os
 import sys
-import tempfile
+import subprocess
 
-# Paths del proyecto
+# ══════════════════════════════════════
+# AUTO-INSTALL DE DEPENDENCIAS
+# ══════════════════════════════════════
+def ensure_pdfminer():
+    """Instala pdfminer.six automáticamente si no está disponible."""
+    try:
+        from pdfminer.high_level import extract_text
+        return True
+    except ImportError:
+        print("pdfminer.six no encontrado. Instalando automáticamente...")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pdfminer.six', '-q'])
+            print("pdfminer.six instalado exitosamente")
+            return True
+        except Exception as e:
+            print(f"No se pudo instalar pdfminer.six: {e}")
+            return False
+
+# Ejecutar al inicio
+PDFMINER_AVAILABLE = ensure_pdfminer()
+
+# ══════════════════════════════════════
+# PATHS Y IMPORTS DEL PROYECTO
+# ══════════════════════════════════════
 sys.path.insert(0, '/home/cdsw')
 sys.path.insert(0, '/home/cdsw/3_job-populate-vectordb')
 
 from milvus import default_server
-from pymilvus import connections, Collection, utility
+from pymilvus import (
+    connections, Collection, utility,
+    FieldSchema, CollectionSchema, DataType
+)
 import utils.model_llm_utils as model_llm
 import utils.model_embedding_utils as model_embedding
 
 # ══════════════════════════════════════
-# MILVUS SETUP
+# CONFIGURACIÓN
 # ══════════════════════════════════════
-COLLECTION_NAME = 'cloudera_ml_docs'
+COLLECTION_NAME = 'rag_documents'
 MILVUS_DATA_DIR = 'milvus-data'
+MAX_TEXT_LENGTH = 1500  # Caracteres máx por documento (protege GPU)
+EMBEDDING_DIM = 384
 
+# ══════════════════════════════════════
+# MILVUS
+# ══════════════════════════════════════
 def start_milvus():
-    """Inicia servidor Milvus y conecta."""
+    """Inicia Milvus y conecta."""
     try:
         connections.disconnect('default')
     except:
@@ -37,508 +67,436 @@ def start_milvus():
     default_server.set_base_dir(MILVUS_DATA_DIR)
     if not default_server.running:
         default_server.start()
-    connections.connect(alias='default', host='localhost', port=default_server.listen_port)
+    connections.connect(
+        alias='default',
+        host='localhost',
+        port=default_server.listen_port
+    )
     print("Milvus conectado")
 
+
 def ensure_collection():
-    """Crea la colección si no existe."""
-    from pymilvus import FieldSchema, CollectionSchema, DataType
+    """Crea la colección con campo de texto incluido."""
     if utility.has_collection(COLLECTION_NAME):
         return Collection(COLLECTION_NAME)
-    
+
     fields = [
-        FieldSchema(name='relativefilepath', dtype=DataType.VARCHAR,
-                     max_length=1000, is_primary=True, auto_id=False),
-        FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=384)
+        FieldSchema(
+            name='doc_id',
+            dtype=DataType.VARCHAR,
+            max_length=500,
+            is_primary=True,
+            auto_id=False
+        ),
+        FieldSchema(
+            name='text_content',
+            dtype=DataType.VARCHAR,
+            max_length=2000,  # Texto limpio y truncado
+        ),
+        FieldSchema(
+            name='embedding',
+            dtype=DataType.FLOAT_VECTOR,
+            dim=EMBEDDING_DIM
+        ),
     ]
     schema = CollectionSchema(fields=fields)
     collection = Collection(name=COLLECTION_NAME, schema=schema)
-    index_params = {
-        'metric_type': 'IP',
-        'index_type': 'IVF_FLAT',
-        'params': {'nlist': 2048}
-    }
-    collection.create_index(field_name="embedding", index_params=index_params)
+    collection.create_index(
+        field_name="embedding",
+        index_params={
+            'metric_type': 'IP',
+            'index_type': 'IVF_FLAT',
+            'params': {'nlist': 2048}
+        }
+    )
+    print(f"Colección '{COLLECTION_NAME}' creada")
     return collection
 
+
 def get_indexed_docs():
-    """Retorna lista de documentos indexados en Milvus."""
+    """Lista documentos indexados."""
     try:
         collection = Collection(COLLECTION_NAME)
         collection.load()
         count = collection.num_entities
-        # Query para obtener los file paths
         results = collection.query(
-            expr="relativefilepath != ''",
-            output_fields=['relativefilepath'],
-            limit=100
+            expr="doc_id != ''",
+            output_fields=['doc_id'],
+            limit=200
         )
         collection.release()
-        docs = [r['relativefilepath'] for r in results]
+        docs = [r['doc_id'] for r in results]
         return docs, count
-    except Exception as e:
-        print(f"Error listando docs: {e}")
+    except:
         return [], 0
 
+
 # ══════════════════════════════════════
-# DOCUMENT PROCESSING
+# EXTRACCIÓN DE TEXTO (BLINDADA)
 # ══════════════════════════════════════
-def extract_text_from_file(file_path: str) -> str:
-    """Extrae texto de un archivo PDF o TXT."""
-    if file_path.lower().endswith('.pdf'):
+def clean_text(text: str) -> str:
+    """Limpia y trunca texto para que sea seguro en Milvus y en la GPU."""
+    if not text:
+        return ""
+    # Eliminar bytes inválidos
+    text = text.encode('utf-8', errors='ignore').decode('utf-8')
+    # Eliminar caracteres nulos y de control
+    text = ''.join(c for c in text if c.isprintable() or c in '\n\t ')
+    # Colapsar espacios múltiples
+    import re
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    # Truncar
+    text = text.strip()[:MAX_TEXT_LENGTH]
+    return text
+
+
+def extract_pdf_text(file_path: str) -> str:
+    """Extrae texto de PDF con múltiples fallbacks."""
+    text = ""
+
+    # Intento 1: pdfminer (mejor calidad)
+    if PDFMINER_AVAILABLE:
         try:
             from pdfminer.high_level import extract_text
             text = extract_text(file_path)
+            if text and text.strip():
+                return text
         except Exception as e:
-            raise ValueError(f"Error extrayendo PDF: {e}")
-    else:
-        with open(file_path, 'r', errors='ignore') as f:
-            text = f.read()
-    
-    # Limpiar UTF-8
-    text = text.encode('utf-8', errors='ignore').decode('utf-8')
-    return text
+            print(f"  pdfminer falló: {e}")
 
-def ingest_file(file_path: str, file_name: str) -> str:
-    """Ingesta un archivo individual a Milvus."""
+    # Intento 2: pypdf / PyPDF2
     try:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            from PyPDF2 import PdfReader
+        reader = PdfReader(file_path)
+        pages_text = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                pages_text.append(t)
+        text = '\n'.join(pages_text)
+        if text and text.strip():
+            return text
+    except Exception as e:
+        print(f"  pypdf/PyPDF2 falló: {e}")
+
+    # Intento 3: leer bytes y filtrar texto ASCII/UTF8
+    try:
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+        # Extraer solo caracteres imprimibles
+        text = ''.join(
+            chr(b) for b in raw
+            if 32 <= b < 127 or b in (10, 13, 9)
+        )
+        if text and len(text.strip()) > 50:
+            return text
+    except Exception as e:
+        print(f"  Raw extraction falló: {e}")
+
+    return text or "[No se pudo extraer texto del PDF]"
+
+
+def extract_text_from_file(file_path: str) -> str:
+    """Extrae texto de cualquier archivo soportado."""
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == '.pdf':
+        text = extract_pdf_text(file_path)
+    else:
+        # TXT, MD, TEXT
+        try:
+            with open(file_path, 'r', errors='ignore') as f:
+                text = f.read()
+        except Exception:
+            with open(file_path, 'rb') as f:
+                text = f.read().decode('utf-8', errors='ignore')
+
+    return clean_text(text)
+
+
+# ══════════════════════════════════════
+# INGESTA
+# ══════════════════════════════════════
+def ingest_file(file_path: str, file_name: str) -> str:
+    """Ingesta un archivo: extrae texto, genera embedding, guarda TODO en Milvus."""
+    try:
+        # Extraer y limpiar texto
         text = extract_text_from_file(file_path)
-        if not text.strip():
+        if not text.strip() or len(text.strip()) < 10:
             return f"⚠️ {file_name}: Archivo vacío o sin texto extraíble"
-        
+
         # Generar embedding
         embedding = model_embedding.get_embeddings(text)
-        
-        # Insertar en Milvus
+
+        # Guardar en Milvus: ID + texto + embedding
         collection = Collection(COLLECTION_NAME)
-        data = [[file_name], [embedding]]
-        collection.insert(data)
+        collection.insert([
+            [file_name],       # doc_id
+            [text],            # text_content (ya limpio y truncado)
+            [embedding],       # embedding vector
+        ])
         collection.flush()
-        
-        return f"✅ {file_name}: Indexado ({len(text)} caracteres)"
+
+        chars = len(text)
+        return f"✅ {file_name}: Indexado ({chars} caracteres)"
     except Exception as e:
-        return f"❌ {file_name}: Error - {str(e)}"
+        return f"❌ {file_name}: {str(e)}"
+
 
 def process_uploads(files) -> str:
-    """Procesa múltiples archivos subidos desde la UI."""
+    """Procesa archivos subidos desde la UI."""
     if not files:
         return "⚠️ No se seleccionaron archivos"
-    
+
     ensure_collection()
     results = []
-    
+
     for file in files:
         file_path = file.name if hasattr(file, 'name') else str(file)
         file_name = os.path.basename(file_path)
-        
-        # Validar extensión
+
         ext = os.path.splitext(file_name)[1].lower()
         if ext not in ('.pdf', '.txt', '.text', '.md'):
-            results.append(f"⏭️ {file_name}: Formato no soportado (usar PDF o TXT)")
+            results.append(f"⏭️ {file_name}: Formato no soportado (PDF o TXT)")
             continue
-        
+
         result = ingest_file(file_path, file_name)
         results.append(result)
-    
-    # Resumen
+
     success = sum(1 for r in results if r.startswith("✅"))
     total = len(results)
-    summary = f"\n{'─' * 40}\n📊 Resultado: {success}/{total} archivos indexados\n"
-    
+    summary = f"\n{'─' * 40}\n📊 {success}/{total} archivos indexados exitosamente"
     return "\n".join(results) + summary
 
+
 def refresh_doc_list():
-    """Actualiza la lista de documentos para mostrar en la UI."""
+    """Lista de docs para la UI."""
     docs, count = get_indexed_docs()
     if not docs:
-        return f"📂 No hay documentos indexados", f"Total: 0 documentos"
-    
-    doc_list = []
-    for d in docs:
-        name = os.path.basename(d)
-        icon = "📄" if name.endswith('.pdf') else "📝"
-        doc_list.append(f"{icon} {name}")
-    
-    doc_text = "\n".join(doc_list)
-    return doc_text, f"Total: {count} documentos indexados"
+        return "📂 No hay documentos indexados", "Total: 0"
+
+    lines = []
+    for d in sorted(docs):
+        icon = "📄" if d.lower().endswith('.pdf') else "📝"
+        lines.append(f"{icon} {d}")
+    return "\n".join(lines), f"Total: {count} documentos"
+
 
 # ══════════════════════════════════════
-# RAG QUERY
+# RAG QUERY (SIN ACCESO A DISCO)
 # ══════════════════════════════════════
-def get_nearest_chunk(collection, question):
-    """Busca el documento más similar a la pregunta."""
-    question_embedding = model_embedding.get_embeddings(question)
-    
-    search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
-    results = collection.search(
-        data=[question_embedding],
-        anns_field="embedding",
-        param=search_params,
-        limit=1,
-        output_fields=['relativefilepath'],
-        consistency_level="Strong"
-    )
-    
-    if not results or not results[0]:
-        return "No se encontraron documentos relevantes.", "Sin fuente"
-    
-    doc_id = results[0].ids[0]
-    score = results[0].distances[0]
-    source_name = os.path.basename(doc_id)
-    
-    # Cargar texto del documento
-    text = load_doc_text(doc_id)
-    return text, f"{source_name} (score: {score:.3f})"
-
-def load_doc_text(id_path):
-    """Carga texto del documento, soportando PDF y TXT."""
-    # Buscar en uploads temporales o en data/
-    possible_paths = [
-        id_path,
-        os.path.join('/home/cdsw/data', id_path),
-        os.path.join('/home/cdsw/data/custom_docs', id_path),
-    ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            text = extract_text_from_file(path)
-            return text[:2000]  # Truncar para no saturar GPU
-    
-    # Si el archivo no existe en disco, retornar mensaje
-    return f"[Documento: {os.path.basename(id_path)} - archivo no encontrado en disco]"
-
 def chat_query(question, history):
-    """Procesa una pregunta del chatbot RAG."""
+    """Pipeline RAG: pregunta → buscar en Milvus → generar respuesta."""
     if not question.strip():
         return "", history
-    
+
     try:
         collection = Collection(COLLECTION_NAME)
         collection.load()
-        
-        # Buscar contexto
-        context, source = get_nearest_chunk(collection, question)
-        collection.release()
-        
-        # Generar respuesta CON contexto
-        prompt_with_context = f"""<human>:{context}. Answer this question based on given context {question}
-<bot>:"""
-        
-        stop_words = ['<human>:', '\n<bot>:']
-        response = model_llm.get_llm_generation(
-            prompt_with_context, stop_words,
-            max_new_tokens=256, do_sample=False,
-            temperature=0.7, top_p=0.85,
-            top_k=70, repetition_penalty=1.07
+
+        # Buscar documento más similar
+        q_embedding = model_embedding.get_embeddings(question)
+        results = collection.search(
+            data=[q_embedding],
+            anns_field="embedding",
+            param={"metric_type": "IP", "params": {"nprobe": 10}},
+            limit=1,
+            output_fields=['doc_id', 'text_content'],  # Traer texto directo
+            consistency_level="Strong"
         )
-        
-        # Agregar fuente
-        full_response = f"{response}\n\n📎 *Fuente: {source}*"
+        collection.release()
+
+        if not results or not results[0]:
+            history = history + [(question, "No encontré documentos relevantes. Sube documentos en la pestaña 📤")]
+            return "", history
+
+        # Extraer contexto DIRECTO de Milvus (sin tocar disco)
+        hit = results[0][0]
+        doc_name = hit.entity.get('doc_id')
+        context = hit.entity.get('text_content')
+        score = hit.distance
+
+        # Generar respuesta con LLM
+        prompt = f"""<human>:{context}. Answer this question based on given context {question}
+<bot>:"""
+
+        response = model_llm.get_llm_generation(
+            prompt,
+            ['<human>:', '\n<bot>:'],
+            max_new_tokens=256,
+            do_sample=False,
+            temperature=0.7,
+            top_p=0.85,
+            top_k=70,
+            repetition_penalty=1.07
+        )
+
+        full_response = f"{response}\n\n📎 *Fuente: {doc_name} (relevancia: {score:.2f})*"
         history = history + [(question, full_response)]
-        
+
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        history = history + [(question, error_msg)]
-    
+        history = history + [(question, f"❌ Error: {str(e)}")]
+
     return "", history
+
 
 # ══════════════════════════════════════
 # GRADIO UI
 # ══════════════════════════════════════
 def create_app():
     import gradio as gr
-    
-    custom_css = """
-    /* Header */
-    .header-container {
+
+    css = """
+    .header-box {
         background: linear-gradient(135deg, #0D3D56 0%, #1B5E7B 60%, #2A8CB5 100%);
-        padding: 24px 32px;
-        border-radius: 14px;
-        margin-bottom: 12px;
+        padding: 24px 32px; border-radius: 14px; margin-bottom: 12px;
         box-shadow: 0 4px 20px rgba(13,61,86,0.15);
     }
-    .header-container h1 {
-        color: white !important;
-        font-size: 26px !important;
-        margin: 0 0 4px !important;
-        font-weight: 700 !important;
-    }
-    .header-container p {
-        color: rgba(255,255,255,0.75) !important;
-        font-size: 14px !important;
-        margin: 0 !important;
-    }
-    .header-container .accent { color: #F96702 !important; }
-    
-    /* Tabs */
-    .tab-nav button {
-        font-weight: 600 !important;
-        font-size: 15px !important;
-        padding: 12px 20px !important;
-    }
-    .tab-nav button.selected {
-        border-bottom: 3px solid #F96702 !important;
-        color: #1B5E7B !important;
-    }
-    
-    /* Upload zone */
-    .upload-zone {
-        border: 2px dashed #B0D8E8 !important;
-        border-radius: 12px !important;
-        background: #F7FBFD !important;
-        transition: all 0.2s !important;
-    }
-    .upload-zone:hover {
-        border-color: #F96702 !important;
-        background: #FFF8F3 !important;
-    }
-    
-    /* Chat */
-    .chatbot .message {
-        border-radius: 12px !important;
-    }
-    
-    /* Doc list */
-    .doc-panel {
-        background: #F7F9FB;
-        border-radius: 12px;
-        padding: 16px;
-        border: 1px solid #E2E8F0;
-    }
-    
-    /* Buttons */
-    .primary-btn {
-        background: #F96702 !important;
-        border: none !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
-    }
-    .primary-btn:hover {
-        background: #FF8534 !important;
-    }
-    .secondary-btn {
-        background: #1B5E7B !important;
-        border: none !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
-        color: white !important;
-    }
-    
-    /* Status */
-    .status-box {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 13px;
-    }
-    
-    /* Footer */
-    .footer-text {
-        text-align: center;
-        padding: 16px;
-        color: #5A6A7A;
-        font-size: 12px;
-    }
+    .header-box h1 { color: white !important; font-size: 26px !important; margin: 0 0 4px !important; }
+    .header-box p { color: rgba(255,255,255,0.7) !important; font-size: 14px !important; margin: 0 !important; }
+    .accent { color: #F96702 !important; }
+    .tab-nav button.selected { border-bottom: 3px solid #F96702 !important; color: #1B5E7B !important; }
+    .upload-area { border: 2px dashed #B0D8E8 !important; border-radius: 12px !important; background: #F7FBFD !important; }
+    .upload-area:hover { border-color: #F96702 !important; background: #FFF8F3 !important; }
+    .footer-info { text-align: center; padding: 16px; color: #5A6A7A; font-size: 12px; }
     """
-    
+
     with gr.Blocks(
         title="RAG Chatbot | Cloudera AI",
         theme=gr.themes.Soft(
-            primary_hue="orange",
-            secondary_hue="blue",
+            primary_hue="orange", secondary_hue="blue",
             font=gr.themes.GoogleFont("DM Sans"),
         ),
-        css=custom_css,
+        css=css,
     ) as app:
-        
-        # ── Header ──
+
         gr.HTML("""
-        <div class="header-container">
+        <div class="header-box">
             <h1>💬 RAG Chatbot <span class="accent">| Cloudera AI</span></h1>
-            <p>Sube documentos PDF o TXT y hazle preguntas en lenguaje natural</p>
+            <p>Sube documentos PDF o TXT y consulta su contenido en lenguaje natural</p>
         </div>
         """)
-        
-        with gr.Tabs() as tabs:
-            # ══════ TAB 1: CHATBOT ══════
-            with gr.Tab("💬 Chatbot", id="chat"):
+
+        with gr.Tabs():
+            # ──── TAB: CHATBOT ────
+            with gr.Tab("💬 Chatbot"):
                 with gr.Row():
-                    # Chat principal
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
-                            label="Conversación",
-                            height=480,
-                            show_label=False,
-                            avatar_images=(None, "https://www.cloudera.com/content/dam/www/marketing/media-library/cloudera-favicon.png"),
+                            height=480, show_label=False,
                             bubble_full_width=False,
                         )
                         with gr.Row():
-                            msg_input = gr.Textbox(
-                                label="",
+                            msg = gr.Textbox(
                                 placeholder="Escribe tu pregunta aquí...",
-                                scale=5,
-                                show_label=False,
-                                container=False,
+                                show_label=False, scale=5, container=False,
                             )
-                            send_btn = gr.Button(
-                                "Enviar",
-                                variant="primary",
-                                scale=1,
-                                elem_classes=["primary-btn"],
-                            )
-                        clear_btn = gr.Button("🗑️ Limpiar chat", size="sm")
-                    
-                    # Panel lateral
+                            send = gr.Button("Enviar", variant="primary", scale=1)
+                        clear = gr.Button("🗑️ Limpiar chat", size="sm")
+
                     with gr.Column(scale=1):
-                        gr.Markdown("### 📚 Base de Conocimiento")
-                        doc_count = gr.Markdown("Total: 0 documentos")
-                        doc_list_display = gr.Textbox(
-                            label="Documentos indexados",
-                            interactive=False,
-                            lines=12,
+                        gr.Markdown("### 📚 Documentos")
+                        doc_count = gr.Markdown("Total: 0")
+                        doc_list = gr.Textbox(
+                            interactive=False, lines=14,
                             show_label=False,
-                            elem_classes=["doc-panel"],
                         )
-                        refresh_btn = gr.Button(
-                            "🔄 Actualizar lista",
-                            size="sm",
-                            elem_classes=["secondary-btn"],
-                        )
-                
-                # Ejemplos
-                gr.Markdown("### 💡 Preguntas de ejemplo")
+                        refresh = gr.Button("🔄 Actualizar", size="sm")
+
                 gr.Examples(
                     examples=[
                         ["What are ML Runtimes?"],
-                        ["What kinds of users use CML?"],
                         ["How do data scientists use CML?"],
                         ["What are iceberg tables?"],
                     ],
-                    inputs=msg_input,
+                    inputs=msg,
                 )
-            
-            # ══════ TAB 2: UPLOAD ══════
-            with gr.Tab("📤 Subir Documentos", id="upload"):
+
+            # ──── TAB: SUBIR DOCUMENTOS ────
+            with gr.Tab("📤 Subir Documentos"):
                 gr.Markdown("""
-                ### Subir Documentos a la Base de Conocimiento
+                ### Agregar Documentos a la Base de Conocimiento
+                Sube archivos **PDF** o **TXT**. El sistema extrae el texto,
+                genera un embedding, y lo indexa en Milvus automáticamente.
                 
-                Sube archivos **PDF** o **TXT** para que el chatbot pueda responder preguntas sobre su contenido.
-                Los documentos se procesan automáticamente: se extrae el texto, se genera un embedding, y se indexan en Milvus.
+                El texto se limpia (UTF-8) y se trunca a un tamaño seguro para la GPU.
+                No hay dependencias externas que puedan fallar.
                 """)
-                
+
                 with gr.Row():
                     with gr.Column(scale=2):
-                        file_upload = gr.File(
-                            label="Arrastra archivos aquí o haz clic para seleccionar",
+                        files = gr.File(
+                            label="Arrastra archivos aquí o haz clic",
                             file_count="multiple",
                             file_types=[".pdf", ".txt", ".text", ".md"],
-                            elem_classes=["upload-zone"],
+                            elem_classes=["upload-area"],
                             height=200,
                         )
                         upload_btn = gr.Button(
-                            "🚀 Procesar e Indexar Documentos",
-                            variant="primary",
-                            size="lg",
-                            elem_classes=["primary-btn"],
+                            "🚀 Procesar e Indexar",
+                            variant="primary", size="lg",
                         )
-                    
                     with gr.Column(scale=1):
-                        upload_status = gr.Textbox(
-                            label="Resultado del procesamiento",
-                            interactive=False,
-                            lines=15,
-                            elem_classes=["status-box"],
+                        upload_log = gr.Textbox(
+                            label="Resultado",
+                            interactive=False, lines=15,
                         )
-                
+
                 gr.Markdown("""
                 ---
-                **Formatos soportados:** PDF, TXT, MD  
-                **Tamaño recomendado:** Máximo 10 MB por archivo  
-                **Documentos ideales:** 5-50 páginas para mejores resultados de RAG
+                **Formatos:** PDF, TXT, MD · **Máx recomendado:** 10 MB por archivo
                 """)
-            
-            # ══════ TAB 3: ABOUT ══════
-            with gr.Tab("ℹ️ Acerca de", id="about"):
+
+            # ──── TAB: ACERCA DE ────
+            with gr.Tab("ℹ️ Arquitectura"):
                 gr.Markdown("""
-                ### Arquitectura RAG (Retrieval-Augmented Generation)
+                ### ¿Cómo funciona?
+
+                **Al subir un documento:**
                 
-                ```
-                📄 Documento (PDF/TXT)
-                    ↓ pdfminer / open()
-                📝 Texto extraído
-                    ↓ all-MiniLM-L6-v2
-                🔢 Embedding (384 dimensiones)
-                    ↓
-                🗄️ Milvus Vector DB
-                ```
+                Documento → Extraer texto (pdfminer/pypdf/raw) → Limpiar UTF-8 → Truncar → Embedding 384-dim → Guardar texto + vector en Milvus
+
+                **Al hacer una pregunta:**
                 
-                ```
-                ❓ Pregunta del usuario
-                    ↓ all-MiniLM-L6-v2
-                🔢 Embedding de la pregunta
-                    ↓ Búsqueda de similitud
-                📄 Documento más relevante
-                    ↓ + pregunta original
-                🤖 LLM genera respuesta contextualizada
-                ```
+                Pregunta → Embedding → Buscar en Milvus → Recuperar texto (directo, sin leer disco) → Prompt + contexto → LLM → Respuesta
                 
                 ---
-                
-                ### Componentes
-                
+
+                ### Diferencia clave vs versión anterior
+
+                | Antes (v1) | Ahora (v3) |
+                |---|---|
+                | Milvus guarda solo el file path | Milvus guarda el texto completo |
+                | Al responder, re-lee el archivo del disco | Al responder, lee de Milvus directo |
+                | Si el PDF tiene bytes malos → crash | Texto ya limpio desde la ingesta |
+                | Si pdfminer no está instalado → crash | Auto-instala + 3 fallbacks |
+                | Documento entero → CUDA OOM | Truncado a 1500 chars desde ingesta |
+
+                ---
+
                 | Componente | Tecnología |
                 |---|---|
                 | Vector Store | Milvus (integrado) |
                 | Embeddings | all-MiniLM-L6-v2 (384-dim) |
                 | LLM | h2ogpt-oig-oasst1-512-6.9b |
+                | Extracción PDF | pdfminer → pypdf → raw (fallbacks) |
                 | Interfaz | Gradio |
-                | Plataforma | Cloudera Machine Learning (CML) |
-                
-                ---
-                
-                **Repositorio:** [github.com/adrianmc/CML_AMP_LLM_Chatbot](https://github.com/adrianmc/CML_AMP_LLM_Chatbot_Augmented_with_Enterprise_Data)  
-                **Construido por:** Cloudera Solutions Engineering
                 """)
-        
-        # ── Footer ──
-        gr.HTML("""
-        <div class="footer-text">
-            Cloudera Solutions Engineering · Powered by open-source AI · 2026
-        </div>
-        """)
-        
-        # ══════ EVENT HANDLERS ══════
-        
-        # Chat
-        send_btn.click(
-            fn=chat_query,
-            inputs=[msg_input, chatbot],
-            outputs=[msg_input, chatbot],
-        )
-        msg_input.submit(
-            fn=chat_query,
-            inputs=[msg_input, chatbot],
-            outputs=[msg_input, chatbot],
-        )
-        clear_btn.click(lambda: ([], ""), outputs=[chatbot, msg_input])
-        
-        # Upload
-        upload_btn.click(
-            fn=process_uploads,
-            inputs=[file_upload],
-            outputs=[upload_status],
-        )
-        
-        # Refresh doc list
-        refresh_btn.click(
-            fn=refresh_doc_list,
-            outputs=[doc_list_display, doc_count],
-        )
-        
-        # Auto-refresh on tab change
-        app.load(
-            fn=refresh_doc_list,
-            outputs=[doc_list_display, doc_count],
-        )
-    
+
+        gr.HTML('<div class="footer-info">Cloudera Solutions Engineering · 2026</div>')
+
+        # ── Events ──
+        send.click(chat_query, [msg, chatbot], [msg, chatbot])
+        msg.submit(chat_query, [msg, chatbot], [msg, chatbot])
+        clear.click(lambda: ([], ""), outputs=[chatbot, msg])
+        upload_btn.click(process_uploads, [files], [upload_log])
+        refresh.click(refresh_doc_list, outputs=[doc_list, doc_count])
+        app.load(refresh_doc_list, outputs=[doc_list, doc_count])
+
     return app
 
 
@@ -546,18 +504,14 @@ def create_app():
 # MAIN
 # ══════════════════════════════════════
 if __name__ == "__main__":
-    print("Iniciando RAG Chatbot...")
-    
-    # Iniciar Milvus
+    print("Iniciando RAG Chatbot v3...")
     start_milvus()
     ensure_collection()
     print("Milvus listo")
-    
-    # Crear y lanzar app
+
     app = create_app()
     app.queue().launch(
-        share=False,
-        show_error=True,
+        share=False, show_error=True,
         server_name='127.0.0.1',
         server_port=int(os.getenv('CDSW_APP_PORT', '8080')),
     )
