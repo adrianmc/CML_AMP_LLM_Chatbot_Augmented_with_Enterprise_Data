@@ -352,7 +352,10 @@ def chat_query(question, history):
         return "", history, get_stats_html()
 
     thinking_msg = "🔍 Buscando documentos relevantes..."
-    history = history + [(question, thinking_msg)]
+    history = history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": thinking_msg},
+    ]
     yield "", history, get_stats_html()
 
     try:
@@ -371,7 +374,7 @@ def chat_query(question, history):
         col.release()
 
         if not results or not results[0]:
-            history[-1] = (question, "No encontré documentos relevantes. Sube archivos en la pestaña 📤")
+            history[-1] = {"role": "assistant", "content": "No encontré documentos relevantes. Sube archivos en la pestaña 📤"}
             yield "", history, get_stats_html()
             return
 
@@ -380,7 +383,7 @@ def chat_query(question, history):
         context = hit.entity.get('text_content')
         score = hit.distance
 
-        history[-1] = (question, f"📄 Encontrado: *{doc_name}*\n\n🤖 Generando respuesta...")
+        history[-1] = {"role": "assistant", "content": f"📄 Encontrado: *{doc_name}*\n\n🤖 Generando respuesta..."}
         yield "", history, get_stats_html()
 
         prompt = f"""<human>:{context}. Answer this question based on given context {question}
@@ -393,11 +396,11 @@ def chat_query(question, history):
         )
 
         source_badge = f"\n\n---\n📎 **Fuente:** {doc_name} · Relevancia: {score:.0%}"
-        history[-1] = (question, response + source_badge)
+        history[-1] = {"role": "assistant", "content": response + source_badge}
         yield "", history, get_stats_html()
 
     except Exception as e:
-        history[-1] = (question, f"❌ Error: {str(e)}")
+        history[-1] = {"role": "assistant", "content": f"❌ Error: {str(e)}"}
         yield "", history, get_stats_html()
 
 # ══════════════════════════════════════
@@ -464,6 +467,7 @@ def create_app():
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
                             height=500, show_label=False,
+                            type="messages",
                         )
                         with gr.Row():
                             msg = gr.Textbox(
@@ -482,9 +486,10 @@ def create_app():
                 gr.Markdown("### 💡 Ejemplos")
                 gr.Examples(
                     examples=[
-                        ["What are ML Runtimes?"],
-                        ["How do data scientists use CML?"],
-                        ["What are iceberg tables?"],
+                        ["¿Cuáles son los puntos clave del documento?"],
+                        ["Resume los hallazgos principales"],
+                        ["¿Qué recomendaciones se mencionan?"],
+                        ["¿Cuáles son los riesgos identificados?"],
                     ],
                     inputs=msg,
                 )
