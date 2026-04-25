@@ -1,40 +1,42 @@
 """
-llm_rag_app.py — RAG Chatbot v3
+llm_rag_app.py — RAG Chatbot v4
 Cloudera Machine Learning
 
-Mejoras sobre v2:
-  - Guarda texto limpio y truncado DENTRO de Milvus (no re-lee archivos del disco)
-  - Auto-instala pdfminer.six si no está disponible
-  - Múltiples fallbacks para extracción de PDF
-  - Zero dependencias externas que puedan fallar en runtime
+v4 mejoras:
+  - Barra de progreso por archivo durante indexación
+  - Animaciones CSS (spinners, pulsos, transiciones)
+  - Panel de estadísticas (docs, chars, última carga)
+  - Indicador "pensando..." animado mientras el LLM genera
+  - Texto almacenado en Milvus (sin acceso a disco al consultar)
+  - Auto-install + fallbacks para PDF
 """
 import os
 import sys
 import subprocess
+import time
+from datetime import datetime
 
 # ══════════════════════════════════════
 # AUTO-INSTALL DE DEPENDENCIAS
 # ══════════════════════════════════════
 def ensure_pdfminer():
-    """Instala pdfminer.six automáticamente si no está disponible."""
     try:
         from pdfminer.high_level import extract_text
         return True
     except ImportError:
-        print("pdfminer.six no encontrado. Instalando automáticamente...")
+        print("Instalando pdfminer.six...")
         try:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pdfminer.six', '-q'])
-            print("pdfminer.six instalado exitosamente")
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', 'pdfminer.six', '-q']
+            )
             return True
-        except Exception as e:
-            print(f"No se pudo instalar pdfminer.six: {e}")
+        except:
             return False
 
-# Ejecutar al inicio
-PDFMINER_AVAILABLE = ensure_pdfminer()
+PDFMINER_OK = ensure_pdfminer()
 
 # ══════════════════════════════════════
-# PATHS Y IMPORTS DEL PROYECTO
+# PATHS
 # ══════════════════════════════════════
 sys.path.insert(0, '/home/cdsw')
 sys.path.insert(0, '/home/cdsw/3_job-populate-vectordb')
@@ -48,300 +50,374 @@ import utils.model_llm_utils as model_llm
 import utils.model_embedding_utils as model_embedding
 
 # ══════════════════════════════════════
-# CONFIGURACIÓN
+# CONFIG
 # ══════════════════════════════════════
-COLLECTION_NAME = 'rag_documents'
-MILVUS_DATA_DIR = 'milvus-data'
-MAX_TEXT_LENGTH = 1500  # Caracteres máx por documento (protege GPU)
-EMBEDDING_DIM = 384
+COLLECTION = 'rag_documents'
+MILVUS_DIR = 'milvus-data'
+MAX_TEXT = 1500
+EMB_DIM = 384
+
+# Estado global para estadísticas
+stats = {
+    "last_upload": None,
+    "total_chars": 0,
+    "session_uploads": 0,
+}
 
 # ══════════════════════════════════════
 # MILVUS
 # ══════════════════════════════════════
 def start_milvus():
-    """Inicia Milvus y conecta."""
     try:
         connections.disconnect('default')
     except:
         pass
-    default_server.set_base_dir(MILVUS_DATA_DIR)
+    default_server.set_base_dir(MILVUS_DIR)
     if not default_server.running:
         default_server.start()
     connections.connect(
-        alias='default',
-        host='localhost',
+        alias='default', host='localhost',
         port=default_server.listen_port
     )
-    print("Milvus conectado")
-
 
 def ensure_collection():
-    """Crea la colección con campo de texto incluido."""
-    if utility.has_collection(COLLECTION_NAME):
-        return Collection(COLLECTION_NAME)
-
+    if utility.has_collection(COLLECTION):
+        return Collection(COLLECTION)
     fields = [
-        FieldSchema(
-            name='doc_id',
-            dtype=DataType.VARCHAR,
-            max_length=500,
-            is_primary=True,
-            auto_id=False
-        ),
-        FieldSchema(
-            name='text_content',
-            dtype=DataType.VARCHAR,
-            max_length=2000,  # Texto limpio y truncado
-        ),
-        FieldSchema(
-            name='embedding',
-            dtype=DataType.FLOAT_VECTOR,
-            dim=EMBEDDING_DIM
-        ),
+        FieldSchema(name='doc_id', dtype=DataType.VARCHAR,
+                     max_length=500, is_primary=True, auto_id=False),
+        FieldSchema(name='text_content', dtype=DataType.VARCHAR,
+                     max_length=2000),
+        FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR,
+                     dim=EMB_DIM),
     ]
     schema = CollectionSchema(fields=fields)
-    collection = Collection(name=COLLECTION_NAME, schema=schema)
-    collection.create_index(
+    col = Collection(name=COLLECTION, schema=schema)
+    col.create_index(
         field_name="embedding",
-        index_params={
-            'metric_type': 'IP',
-            'index_type': 'IVF_FLAT',
-            'params': {'nlist': 2048}
-        }
+        index_params={'metric_type': 'IP', 'index_type': 'IVF_FLAT',
+                      'params': {'nlist': 2048}}
     )
-    print(f"Colección '{COLLECTION_NAME}' creada")
-    return collection
-
+    return col
 
 def get_indexed_docs():
-    """Lista documentos indexados."""
     try:
-        collection = Collection(COLLECTION_NAME)
-        collection.load()
-        count = collection.num_entities
-        results = collection.query(
-            expr="doc_id != ''",
-            output_fields=['doc_id'],
-            limit=200
-        )
-        collection.release()
-        docs = [r['doc_id'] for r in results]
-        return docs, count
+        col = Collection(COLLECTION)
+        col.load()
+        count = col.num_entities
+        res = col.query(expr="doc_id != ''",
+                        output_fields=['doc_id', 'text_content'], limit=200)
+        col.release()
+        return res, count
     except:
         return [], 0
 
-
 # ══════════════════════════════════════
-# EXTRACCIÓN DE TEXTO (BLINDADA)
+# TEXT EXTRACTION (BULLETPROOF)
 # ══════════════════════════════════════
-def clean_text(text: str) -> str:
-    """Limpia y trunca texto para que sea seguro en Milvus y en la GPU."""
+def clean_text(text):
     if not text:
         return ""
-    # Eliminar bytes inválidos
-    text = text.encode('utf-8', errors='ignore').decode('utf-8')
-    # Eliminar caracteres nulos y de control
-    text = ''.join(c for c in text if c.isprintable() or c in '\n\t ')
-    # Colapsar espacios múltiples
     import re
+    text = text.encode('utf-8', errors='ignore').decode('utf-8')
+    text = ''.join(c for c in text if c.isprintable() or c in '\n\t ')
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
-    # Truncar
-    text = text.strip()[:MAX_TEXT_LENGTH]
-    return text
+    return text.strip()[:MAX_TEXT]
 
-
-def extract_pdf_text(file_path: str) -> str:
-    """Extrae texto de PDF con múltiples fallbacks."""
-    text = ""
-
-    # Intento 1: pdfminer (mejor calidad)
-    if PDFMINER_AVAILABLE:
+def extract_pdf(path):
+    # Fallback 1: pdfminer
+    if PDFMINER_OK:
         try:
             from pdfminer.high_level import extract_text
-            text = extract_text(file_path)
-            if text and text.strip():
-                return text
-        except Exception as e:
-            print(f"  pdfminer falló: {e}")
-
-    # Intento 2: pypdf / PyPDF2
+            t = extract_text(path)
+            if t and t.strip():
+                return t
+        except:
+            pass
+    # Fallback 2: pypdf
     try:
         try:
             from pypdf import PdfReader
         except ImportError:
             from PyPDF2 import PdfReader
-        reader = PdfReader(file_path)
-        pages_text = []
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                pages_text.append(t)
-        text = '\n'.join(pages_text)
-        if text and text.strip():
-            return text
-    except Exception as e:
-        print(f"  pypdf/PyPDF2 falló: {e}")
-
-    # Intento 3: leer bytes y filtrar texto ASCII/UTF8
+        r = PdfReader(path)
+        t = '\n'.join(p.extract_text() or '' for p in r.pages)
+        if t.strip():
+            return t
+    except:
+        pass
+    # Fallback 3: raw
     try:
-        with open(file_path, 'rb') as f:
+        with open(path, 'rb') as f:
             raw = f.read()
-        # Extraer solo caracteres imprimibles
-        text = ''.join(
-            chr(b) for b in raw
-            if 32 <= b < 127 or b in (10, 13, 9)
-        )
-        if text and len(text.strip()) > 50:
-            return text
-    except Exception as e:
-        print(f"  Raw extraction falló: {e}")
+        return ''.join(chr(b) for b in raw if 32 <= b < 127 or b in (10, 13, 9))
+    except:
+        return "[No se pudo extraer texto]"
 
-    return text or "[No se pudo extraer texto del PDF]"
-
-
-def extract_text_from_file(file_path: str) -> str:
-    """Extrae texto de cualquier archivo soportado."""
-    ext = os.path.splitext(file_path)[1].lower()
-
-    if ext == '.pdf':
-        text = extract_pdf_text(file_path)
-    else:
-        # TXT, MD, TEXT
-        try:
-            with open(file_path, 'r', errors='ignore') as f:
-                text = f.read()
-        except Exception:
-            with open(file_path, 'rb') as f:
-                text = f.read().decode('utf-8', errors='ignore')
-
-    return clean_text(text)
-
-
-# ══════════════════════════════════════
-# INGESTA
-# ══════════════════════════════════════
-def ingest_file(file_path: str, file_name: str) -> str:
-    """Ingesta un archivo: extrae texto, genera embedding, guarda TODO en Milvus."""
+def extract_text(path):
+    if path.lower().endswith('.pdf'):
+        return clean_text(extract_pdf(path))
     try:
-        # Extraer y limpiar texto
-        text = extract_text_from_file(file_path)
-        if not text.strip() or len(text.strip()) < 10:
-            return f"⚠️ {file_name}: Archivo vacío o sin texto extraíble"
+        with open(path, 'r', errors='ignore') as f:
+            return clean_text(f.read())
+    except:
+        with open(path, 'rb') as f:
+            return clean_text(f.read().decode('utf-8', errors='ignore'))
 
-        # Generar embedding
-        embedding = model_embedding.get_embeddings(text)
+# ══════════════════════════════════════
+# INGESTA CON PROGRESO
+# ══════════════════════════════════════
+def process_uploads(files, progress=None):
+    """Procesa archivos con barra de progreso de Gradio."""
+    import gradio as gr
 
-        # Guardar en Milvus: ID + texto + embedding
-        collection = Collection(COLLECTION_NAME)
-        collection.insert([
-            [file_name],       # doc_id
-            [text],            # text_content (ya limpio y truncado)
-            [embedding],       # embedding vector
-        ])
-        collection.flush()
-
-        chars = len(text)
-        return f"✅ {file_name}: Indexado ({chars} caracteres)"
-    except Exception as e:
-        return f"❌ {file_name}: {str(e)}"
-
-
-def process_uploads(files) -> str:
-    """Procesa archivos subidos desde la UI."""
     if not files:
-        return "⚠️ No se seleccionaron archivos"
+        return render_log([("⚠️", "No se seleccionaron archivos", "warn")])
 
     ensure_collection()
-    results = []
+    entries = []
+    total = len(files)
 
-    for file in files:
-        file_path = file.name if hasattr(file, 'name') else str(file)
-        file_name = os.path.basename(file_path)
+    if progress is not None:
+        progress(0, desc="Preparando archivos...")
 
-        ext = os.path.splitext(file_name)[1].lower()
+    for i, file in enumerate(files):
+        path = file.name if hasattr(file, 'name') else str(file)
+        name = os.path.basename(path)
+        ext = os.path.splitext(name)[1].lower()
+
+        if progress is not None:
+            progress((i) / total, desc=f"Procesando {i+1}/{total}: {name}")
+
         if ext not in ('.pdf', '.txt', '.text', '.md'):
-            results.append(f"⏭️ {file_name}: Formato no soportado (PDF o TXT)")
+            entries.append(("⏭️", name, "skip", "Formato no soportado"))
             continue
 
-        result = ingest_file(file_path, file_name)
-        results.append(result)
+        try:
+            # Paso 1: Extraer texto
+            text = extract_text(path)
+            if not text.strip() or len(text.strip()) < 10:
+                entries.append(("⚠️", name, "warn", "Sin texto extraíble"))
+                continue
 
-    success = sum(1 for r in results if r.startswith("✅"))
-    total = len(results)
-    summary = f"\n{'─' * 40}\n📊 {success}/{total} archivos indexados exitosamente"
-    return "\n".join(results) + summary
+            # Paso 2: Generar embedding
+            embedding = model_embedding.get_embeddings(text)
+
+            # Paso 3: Guardar en Milvus
+            col = Collection(COLLECTION)
+            col.insert([[name], [text], [embedding]])
+            col.flush()
+
+            chars = len(text)
+            stats["total_chars"] += chars
+            stats["session_uploads"] += 1
+            stats["last_upload"] = datetime.now().strftime("%H:%M:%S")
+
+            entries.append(("✅", name, "ok", f"{chars} caracteres"))
+
+        except Exception as e:
+            entries.append(("❌", name, "error", str(e)[:80]))
+
+    if progress is not None:
+        progress(1.0, desc="¡Completado!")
+
+    return render_log(entries)
 
 
-def refresh_doc_list():
-    """Lista de docs para la UI."""
-    docs, count = get_indexed_docs()
-    if not docs:
-        return "📂 No hay documentos indexados", "Total: 0"
+def render_log(entries):
+    """Genera HTML visual para el log de procesamiento."""
+    html_parts = []
+    ok = sum(1 for e in entries if e[2] == "ok")
+    total = len(entries)
 
-    lines = []
-    for d in sorted(docs):
-        icon = "📄" if d.lower().endswith('.pdf') else "📝"
-        lines.append(f"{icon} {d}")
-    return "\n".join(lines), f"Total: {count} documentos"
+    for icon, name, status, *detail in entries:
+        detail_text = detail[0] if detail else ""
+        if status == "ok":
+            bg = "#E8F5E9"; border = "#4CAF50"; color = "#2E7D32"
+        elif status == "error":
+            bg = "#FFEBEE"; border = "#E53935"; color = "#C62828"
+        elif status == "warn":
+            bg = "#FFF8E1"; border = "#FFB74D"; color = "#E65100"
+        else:
+            bg = "#F5F5F5"; border = "#BDBDBD"; color = "#616161"
+
+        html_parts.append(f"""
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;
+                    margin:6px 0;border-radius:10px;background:{bg};
+                    border-left:4px solid {border};
+                    animation:slideIn 0.3s ease-out both;
+                    animation-delay:{entries.index((icon,name,status,*detail))*0.1}s">
+            <span style="font-size:18px">{icon}</span>
+            <div style="flex:1">
+                <div style="font-weight:600;color:{color};font-size:14px">{name}</div>
+                <div style="font-size:12px;color:#666">{detail_text}</div>
+            </div>
+        </div>
+        """)
+
+    # Resumen
+    if ok == total and total > 0:
+        summary_bg = "#E8F5E9"; summary_icon = "🎉"; summary_text = "¡Todos los archivos indexados!"
+    elif ok > 0:
+        summary_bg = "#FFF8E1"; summary_icon = "⚡"; summary_text = f"{ok}/{total} archivos indexados"
+    elif total > 0:
+        summary_bg = "#FFEBEE"; summary_icon = "😞"; summary_text = "No se pudo indexar ningún archivo"
+    else:
+        summary_bg = "#F5F5F5"; summary_icon = "📭"; summary_text = "Sin archivos"
+
+    summary_html = f"""
+    <div style="margin-top:12px;padding:14px 18px;border-radius:12px;
+                background:{summary_bg};text-align:center;
+                animation:slideIn 0.4s ease-out both;
+                animation-delay:{len(entries)*0.1}s">
+        <span style="font-size:24px">{summary_icon}</span>
+        <div style="font-weight:700;font-size:16px;margin-top:4px">{summary_text}</div>
+    </div>
+    """
+
+    return f"""
+    <style>
+        @keyframes slideIn {{
+            from {{ opacity:0; transform:translateX(-12px); }}
+            to {{ opacity:1; transform:translateX(0); }}
+        }}
+    </style>
+    {"".join(html_parts)}
+    {summary_html}
+    """
 
 
 # ══════════════════════════════════════
-# RAG QUERY (SIN ACCESO A DISCO)
+# STATS PANEL
+# ══════════════════════════════════════
+def get_stats_html():
+    """Genera panel de estadísticas visual."""
+    docs, count = get_indexed_docs()
+    total_chars = sum(len(d.get('text_content', '')) for d in docs)
+    last = stats.get("last_upload", "—")
+    session = stats.get("session_uploads", 0)
+
+    # Doc list
+    doc_items = ""
+    for d in sorted(docs, key=lambda x: x['doc_id']):
+        name = d['doc_id']
+        chars = len(d.get('text_content', ''))
+        icon = "📄" if name.lower().endswith('.pdf') else "📝"
+        doc_items += f"""
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;
+                    border-radius:8px;background:#F7F9FB;margin:4px 0;
+                    border:1px solid #E2E8F0;font-size:13px;
+                    transition:all 0.2s;cursor:default"
+             onmouseover="this.style.background='#EAF3F7';this.style.borderColor='#B0D8E8'"
+             onmouseout="this.style.background='#F7F9FB';this.style.borderColor='#E2E8F0'">
+            <span>{icon}</span>
+            <span style="flex:1;font-weight:500;color:#1A2332">{name}</span>
+            <span style="color:#5A6A7A;font-size:11px">{chars} chars</span>
+        </div>
+        """
+
+    if not doc_items:
+        doc_items = """
+        <div style="text-align:center;padding:32px;color:#9E9E9E">
+            <div style="font-size:36px;margin-bottom:8px">📂</div>
+            <div>No hay documentos indexados</div>
+            <div style="font-size:12px;margin-top:4px">Sube archivos en la pestaña 📤</div>
+        </div>
+        """
+
+    return f"""
+    <style>
+        @keyframes pulse {{ 0%,100%{{ opacity:1 }} 50%{{ opacity:.6 }} }}
+        @keyframes countUp {{ from{{ opacity:0;transform:translateY(8px) }} to{{ opacity:1;transform:translateY(0) }} }}
+        .stat-card {{
+            background: white; border-radius: 12px; padding: 14px 16px;
+            border: 1px solid #E2E8F0; text-align: center;
+            animation: countUp 0.4s ease-out both;
+        }}
+        .stat-num {{ font-size: 28px; font-weight: 700; color: #1B5E7B; line-height: 1.2; }}
+        .stat-label {{ font-size: 11px; color: #5A6A7A; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }}
+    </style>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+        <div class="stat-card" style="animation-delay:0s">
+            <div class="stat-num" style="color:#F96702">{count}</div>
+            <div class="stat-label">Documentos</div>
+        </div>
+        <div class="stat-card" style="animation-delay:0.1s">
+            <div class="stat-num">{total_chars:,}</div>
+            <div class="stat-label">Caracteres</div>
+        </div>
+        <div class="stat-card" style="animation-delay:0.2s">
+            <div class="stat-num" style="font-size:16px;padding-top:6px">{last}</div>
+            <div class="stat-label">Última carga</div>
+        </div>
+    </div>
+
+    <div style="max-height:340px;overflow-y:auto;padding-right:4px">
+        {doc_items}
+    </div>
+    """
+
+# ══════════════════════════════════════
+# RAG QUERY (CON "PENSANDO...")
 # ══════════════════════════════════════
 def chat_query(question, history):
-    """Pipeline RAG: pregunta → buscar en Milvus → generar respuesta."""
     if not question.strip():
-        return "", history
+        return "", history, get_stats_html()
+
+    # Paso 1: Mostrar "pensando..."
+    thinking_msg = "🔍 Buscando documentos relevantes..."
+    history = history + [(question, thinking_msg)]
+    yield "", history, get_stats_html()
 
     try:
-        collection = Collection(COLLECTION_NAME)
-        collection.load()
+        col = Collection(COLLECTION)
+        col.load()
 
-        # Buscar documento más similar
-        q_embedding = model_embedding.get_embeddings(question)
-        results = collection.search(
-            data=[q_embedding],
+        q_emb = model_embedding.get_embeddings(question)
+        results = col.search(
+            data=[q_emb],
             anns_field="embedding",
             param={"metric_type": "IP", "params": {"nprobe": 10}},
             limit=1,
-            output_fields=['doc_id', 'text_content'],  # Traer texto directo
+            output_fields=['doc_id', 'text_content'],
             consistency_level="Strong"
         )
-        collection.release()
+        col.release()
 
         if not results or not results[0]:
-            history = history + [(question, "No encontré documentos relevantes. Sube documentos en la pestaña 📤")]
-            return "", history
+            history[-1] = (question, "No encontré documentos relevantes. Sube archivos en la pestaña 📤")
+            yield "", history, get_stats_html()
+            return
 
-        # Extraer contexto DIRECTO de Milvus (sin tocar disco)
         hit = results[0][0]
         doc_name = hit.entity.get('doc_id')
         context = hit.entity.get('text_content')
         score = hit.distance
 
-        # Generar respuesta con LLM
+        # Paso 2: Actualizar a "generando respuesta..."
+        history[-1] = (question, f"📄 Encontrado: *{doc_name}*\n\n🤖 Generando respuesta...")
+        yield "", history, get_stats_html()
+
+        # Paso 3: Generar con LLM
         prompt = f"""<human>:{context}. Answer this question based on given context {question}
 <bot>:"""
-
         response = model_llm.get_llm_generation(
-            prompt,
-            ['<human>:', '\n<bot>:'],
-            max_new_tokens=256,
-            do_sample=False,
-            temperature=0.7,
-            top_p=0.85,
-            top_k=70,
-            repetition_penalty=1.07
+            prompt, ['<human>:', '\n<bot>:'],
+            max_new_tokens=256, do_sample=False,
+            temperature=0.7, top_p=0.85,
+            top_k=70, repetition_penalty=1.07
         )
 
-        full_response = f"{response}\n\n📎 *Fuente: {doc_name} (relevancia: {score:.2f})*"
-        history = history + [(question, full_response)]
+        # Paso 4: Mostrar respuesta final
+        source_badge = f"\n\n---\n📎 **Fuente:** {doc_name} · Relevancia: {score:.0%}"
+        history[-1] = (question, response + source_badge)
+        yield "", history, get_stats_html()
 
     except Exception as e:
-        history = history + [(question, f"❌ Error: {str(e)}")]
-
-    return "", history
+        history[-1] = (question, f"❌ Error: {str(e)}")
+        yield "", history, get_stats_html()
 
 
 # ══════════════════════════════════════
@@ -351,18 +427,73 @@ def create_app():
     import gradio as gr
 
     css = """
+    /* Header */
     .header-box {
-        background: linear-gradient(135deg, #0D3D56 0%, #1B5E7B 60%, #2A8CB5 100%);
-        padding: 24px 32px; border-radius: 14px; margin-bottom: 12px;
-        box-shadow: 0 4px 20px rgba(13,61,86,0.15);
+        background: linear-gradient(135deg, #0D3D56 0%, #1B5E7B 50%, #2A8CB5 100%);
+        padding: 28px 32px; border-radius: 16px; margin-bottom: 16px;
+        box-shadow: 0 4px 24px rgba(13,61,86,0.18);
+        position: relative; overflow: hidden;
     }
-    .header-box h1 { color: white !important; font-size: 26px !important; margin: 0 0 4px !important; }
-    .header-box p { color: rgba(255,255,255,0.7) !important; font-size: 14px !important; margin: 0 !important; }
+    .header-box::before {
+        content: ''; position: absolute; top: -40%; right: -15%;
+        width: 300px; height: 300px; border-radius: 50%;
+        background: rgba(249,103,2,0.08);
+    }
+    .header-box h1 {
+        color: white !important; font-size: 28px !important;
+        margin: 0 0 6px !important; position: relative; z-index: 1;
+    }
+    .header-box p {
+        color: rgba(255,255,255,0.75) !important; font-size: 14px !important;
+        margin: 0 !important; position: relative; z-index: 1;
+    }
     .accent { color: #F96702 !important; }
-    .tab-nav button.selected { border-bottom: 3px solid #F96702 !important; color: #1B5E7B !important; }
-    .upload-area { border: 2px dashed #B0D8E8 !important; border-radius: 12px !important; background: #F7FBFD !important; }
-    .upload-area:hover { border-color: #F96702 !important; background: #FFF8F3 !important; }
-    .footer-info { text-align: center; padding: 16px; color: #5A6A7A; font-size: 12px; }
+
+    /* Tabs */
+    .tab-nav { border-bottom: 2px solid #E2E8F0 !important; }
+    .tab-nav button {
+        font-weight: 600 !important; font-size: 15px !important;
+        padding: 14px 22px !important; transition: all 0.2s !important;
+    }
+    .tab-nav button.selected {
+        border-bottom: 3px solid #F96702 !important;
+        color: #1B5E7B !important;
+    }
+
+    /* Upload */
+    .upload-zone {
+        border: 2px dashed #B0D8E8 !important; border-radius: 14px !important;
+        background: #F7FBFD !important; transition: all 0.3s !important;
+    }
+    .upload-zone:hover {
+        border-color: #F96702 !important; background: #FFF8F3 !important;
+        transform: translateY(-2px); box-shadow: 0 8px 24px rgba(249,103,2,0.1);
+    }
+
+    /* Chatbot */
+    .chatbot { border-radius: 14px !important; }
+    .chatbot .message.bot {
+        animation: msgIn 0.3s ease-out both;
+    }
+    @keyframes msgIn {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Buttons */
+    .gr-button-primary {
+        background: linear-gradient(135deg, #F96702, #FF8534) !important;
+        border: none !important; border-radius: 12px !important;
+        font-weight: 600 !important; box-shadow: 0 4px 12px rgba(249,103,2,0.25) !important;
+        transition: all 0.2s !important;
+    }
+    .gr-button-primary:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 6px 20px rgba(249,103,2,0.35) !important;
+    }
+
+    /* Footer */
+    .footer { text-align:center; padding:20px; color:#9E9E9E; font-size:12px; }
     """
 
     with gr.Blocks(
@@ -374,20 +505,21 @@ def create_app():
         css=css,
     ) as app:
 
+        # Header
         gr.HTML("""
         <div class="header-box">
             <h1>💬 RAG Chatbot <span class="accent">| Cloudera AI</span></h1>
-            <p>Sube documentos PDF o TXT y consulta su contenido en lenguaje natural</p>
+            <p>Sube documentos · Haz preguntas · Obtén respuestas inteligentes</p>
         </div>
         """)
 
         with gr.Tabs():
-            # ──── TAB: CHATBOT ────
+            # ═══ TAB: CHAT ═══
             with gr.Tab("💬 Chatbot"):
                 with gr.Row():
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
-                            height=480, show_label=False,
+                            height=500, show_label=False,
                             bubble_full_width=False,
                         )
                         with gr.Row():
@@ -395,18 +527,17 @@ def create_app():
                                 placeholder="Escribe tu pregunta aquí...",
                                 show_label=False, scale=5, container=False,
                             )
-                            send = gr.Button("Enviar", variant="primary", scale=1)
+                            send = gr.Button("Enviar ➤", variant="primary", scale=1)
                         clear = gr.Button("🗑️ Limpiar chat", size="sm")
 
-                    with gr.Column(scale=1):
-                        gr.Markdown("### 📚 Documentos")
-                        doc_count = gr.Markdown("Total: 0")
-                        doc_list = gr.Textbox(
-                            interactive=False, lines=14,
-                            show_label=False,
+                    with gr.Column(scale=1, min_width=280):
+                        stats_panel = gr.HTML(
+                            value="<div style='padding:20px;text-align:center;color:#999'>Cargando...</div>",
+                            label="",
                         )
                         refresh = gr.Button("🔄 Actualizar", size="sm")
 
+                gr.Markdown("### 💡 Ejemplos")
                 gr.Examples(
                     examples=[
                         ["What are ML Runtimes?"],
@@ -416,99 +547,113 @@ def create_app():
                     inputs=msg,
                 )
 
-            # ──── TAB: SUBIR DOCUMENTOS ────
+            # ═══ TAB: UPLOAD ═══
             with gr.Tab("📤 Subir Documentos"):
                 gr.Markdown("""
                 ### Agregar Documentos a la Base de Conocimiento
-                Sube archivos **PDF** o **TXT**. El sistema extrae el texto,
-                genera un embedding, y lo indexa en Milvus automáticamente.
-                
-                El texto se limpia (UTF-8) y se trunca a un tamaño seguro para la GPU.
-                No hay dependencias externas que puedan fallar.
+                Arrastra archivos **PDF** o **TXT** y haz clic en procesar.
+                El sistema extrae el texto, lo limpia, genera embeddings, y lo almacena en Milvus.
                 """)
-
                 with gr.Row():
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=1):
                         files = gr.File(
-                            label="Arrastra archivos aquí o haz clic",
+                            label="Arrastra archivos aquí",
                             file_count="multiple",
                             file_types=[".pdf", ".txt", ".text", ".md"],
-                            elem_classes=["upload-area"],
-                            height=200,
+                            elem_classes=["upload-zone"],
+                            height=220,
                         )
                         upload_btn = gr.Button(
                             "🚀 Procesar e Indexar",
                             variant="primary", size="lg",
                         )
                     with gr.Column(scale=1):
-                        upload_log = gr.Textbox(
-                            label="Resultado",
-                            interactive=False, lines=15,
+                        upload_log = gr.HTML(
+                            value="""
+                            <div style="text-align:center;padding:60px 20px;color:#BDBDBD">
+                                <div style="font-size:48px;margin-bottom:12px">📤</div>
+                                <div style="font-size:15px">Los resultados aparecerán aquí</div>
+                            </div>
+                            """,
                         )
 
                 gr.Markdown("""
                 ---
-                **Formatos:** PDF, TXT, MD · **Máx recomendado:** 10 MB por archivo
+                **Formatos:** PDF, TXT, MD · **Máx recomendado:** 10 MB por archivo ·
+                **Auto-instalación:** pdfminer se instala automáticamente si no está disponible
                 """)
 
-            # ──── TAB: ACERCA DE ────
+            # ═══ TAB: ABOUT ═══
             with gr.Tab("ℹ️ Arquitectura"):
                 gr.Markdown("""
                 ### ¿Cómo funciona?
 
                 **Al subir un documento:**
-                
-                Documento → Extraer texto (pdfminer/pypdf/raw) → Limpiar UTF-8 → Truncar → Embedding 384-dim → Guardar texto + vector en Milvus
+
+                ```
+                📄 Documento (PDF/TXT)
+                  ↓ pdfminer → pypdf → raw (3 fallbacks)
+                📝 Texto extraído
+                  ↓ Limpiar UTF-8 + truncar a 1500 chars
+                🔢 Embedding (all-MiniLM-L6-v2, 384-dim)
+                  ↓
+                🗄️ Milvus: guarda texto + vector juntos
+                ```
 
                 **Al hacer una pregunta:**
-                
-                Pregunta → Embedding → Buscar en Milvus → Recuperar texto (directo, sin leer disco) → Prompt + contexto → LLM → Respuesta
-                
-                ---
 
-                ### Diferencia clave vs versión anterior
-
-                | Antes (v1) | Ahora (v3) |
-                |---|---|
-                | Milvus guarda solo el file path | Milvus guarda el texto completo |
-                | Al responder, re-lee el archivo del disco | Al responder, lee de Milvus directo |
-                | Si el PDF tiene bytes malos → crash | Texto ya limpio desde la ingesta |
-                | Si pdfminer no está instalado → crash | Auto-instala + 3 fallbacks |
-                | Documento entero → CUDA OOM | Truncado a 1500 chars desde ingesta |
+                ```
+                ❓ Pregunta
+                  ↓ Embedding
+                🔍 Búsqueda en Milvus
+                  ↓ Texto directo (sin leer disco)
+                🤖 LLM + contexto → Respuesta
+                ```
 
                 ---
 
-                | Componente | Tecnología |
+                ### ¿Por qué es robusto?
+
+                | Problema | Solución |
                 |---|---|
-                | Vector Store | Milvus (integrado) |
-                | Embeddings | all-MiniLM-L6-v2 (384-dim) |
-                | LLM | h2ogpt-oig-oasst1-512-6.9b |
-                | Extracción PDF | pdfminer → pypdf → raw (fallbacks) |
-                | Interfaz | Gradio |
+                | pdfminer no instalado | Auto-instala + 2 fallbacks |
+                | Bytes UTF-8 inválidos | Limpieza al ingestar |
+                | CUDA out of memory | Truncado a 1500 chars |
+                | Archivo borrado después de indexar | Texto vive en Milvus |
+                | Interfaz se congela | Progreso visual por archivo |
                 """)
 
-        gr.HTML('<div class="footer-info">Cloudera Solutions Engineering · 2026</div>')
+        gr.HTML('<div class="footer">Cloudera Solutions Engineering · Powered by Open-Source AI · 2026</div>')
 
-        # ── Events ──
-        send.click(chat_query, [msg, chatbot], [msg, chatbot])
-        msg.submit(chat_query, [msg, chatbot], [msg, chatbot])
-        clear.click(lambda: ([], ""), outputs=[chatbot, msg])
-        upload_btn.click(process_uploads, [files], [upload_log])
-        refresh.click(refresh_doc_list, outputs=[doc_list, doc_count])
-        app.load(refresh_doc_list, outputs=[doc_list, doc_count])
+        # ═══ EVENTS ═══
+        send.click(
+            chat_query, [msg, chatbot], [msg, chatbot, stats_panel],
+        )
+        msg.submit(
+            chat_query, [msg, chatbot], [msg, chatbot, stats_panel],
+        )
+        clear.click(
+            lambda: ([], "", get_stats_html()),
+            outputs=[chatbot, msg, stats_panel],
+        )
+        upload_btn.click(
+            process_uploads, [files], [upload_log],
+        ).then(
+            lambda: get_stats_html(), outputs=[stats_panel],
+        )
+        refresh.click(lambda: get_stats_html(), outputs=[stats_panel])
+        app.load(lambda: get_stats_html(), outputs=[stats_panel])
 
     return app
-
 
 # ══════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════
 if __name__ == "__main__":
-    print("Iniciando RAG Chatbot v3...")
+    print("RAG Chatbot v4 iniciando...")
     start_milvus()
     ensure_collection()
     print("Milvus listo")
-
     app = create_app()
     app.queue().launch(
         share=False, show_error=True,
