@@ -467,7 +467,6 @@ def create_app():
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
                             height=500, show_label=False,
-                            type="messages",
                         )
                         with gr.Row():
                             msg = gr.Textbox(
