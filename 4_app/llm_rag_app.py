@@ -1,8 +1,9 @@
 """
 llm_rag_app.py — RAG Chatbot v4
 Cloudera Machine Learning
+Compatible con Gradio 6.0+
 
-v4 mejoras:
+Features:
   - Barra de progreso por archivo durante indexación
   - Animaciones CSS (spinners, pulsos, transiciones)
   - Panel de estadísticas (docs, chars, última carga)
@@ -57,7 +58,6 @@ MILVUS_DIR = 'milvus-data'
 MAX_TEXT = 1500
 EMB_DIM = 384
 
-# Estado global para estadísticas
 stats = {
     "last_upload": None,
     "total_chars": 0,
@@ -126,7 +126,6 @@ def clean_text(text):
     return text.strip()[:MAX_TEXT]
 
 def extract_pdf(path):
-    # Fallback 1: pdfminer
     if PDFMINER_OK:
         try:
             from pdfminer.high_level import extract_text
@@ -135,7 +134,6 @@ def extract_pdf(path):
                 return t
         except:
             pass
-    # Fallback 2: pypdf
     try:
         try:
             from pypdf import PdfReader
@@ -147,7 +145,6 @@ def extract_pdf(path):
             return t
     except:
         pass
-    # Fallback 3: raw
     try:
         with open(path, 'rb') as f:
             raw = f.read()
@@ -155,7 +152,7 @@ def extract_pdf(path):
     except:
         return "[No se pudo extraer texto]"
 
-def extract_text(path):
+def extract_text_from_file(path):
     if path.lower().endswith('.pdf'):
         return clean_text(extract_pdf(path))
     try:
@@ -169,11 +166,10 @@ def extract_text(path):
 # INGESTA CON PROGRESO
 # ══════════════════════════════════════
 def process_uploads(files, progress=None):
-    """Procesa archivos con barra de progreso de Gradio."""
     import gradio as gr
 
     if not files:
-        return render_log([("⚠️", "No se seleccionaron archivos", "warn")])
+        return render_log([("⚠️", "No se seleccionaron archivos", "warn", "")])
 
     ensure_collection()
     entries = []
@@ -188,23 +184,20 @@ def process_uploads(files, progress=None):
         ext = os.path.splitext(name)[1].lower()
 
         if progress is not None:
-            progress((i) / total, desc=f"Procesando {i+1}/{total}: {name}")
+            progress(i / total, desc=f"Procesando {i+1}/{total}: {name}")
 
         if ext not in ('.pdf', '.txt', '.text', '.md'):
             entries.append(("⏭️", name, "skip", "Formato no soportado"))
             continue
 
         try:
-            # Paso 1: Extraer texto
-            text = extract_text(path)
+            text = extract_text_from_file(path)
             if not text.strip() or len(text.strip()) < 10:
                 entries.append(("⚠️", name, "warn", "Sin texto extraíble"))
                 continue
 
-            # Paso 2: Generar embedding
             embedding = model_embedding.get_embeddings(text)
 
-            # Paso 3: Guardar en Milvus
             col = Collection(COLLECTION)
             col.insert([[name], [text], [embedding]])
             col.flush()
@@ -226,13 +219,11 @@ def process_uploads(files, progress=None):
 
 
 def render_log(entries):
-    """Genera HTML visual para el log de procesamiento."""
     html_parts = []
     ok = sum(1 for e in entries if e[2] == "ok")
     total = len(entries)
 
-    for icon, name, status, *detail in entries:
-        detail_text = detail[0] if detail else ""
+    for idx, (icon, name, status, detail) in enumerate(entries):
         if status == "ok":
             bg = "#E8F5E9"; border = "#4CAF50"; color = "#2E7D32"
         elif status == "error":
@@ -247,16 +238,15 @@ def render_log(entries):
                     margin:6px 0;border-radius:10px;background:{bg};
                     border-left:4px solid {border};
                     animation:slideIn 0.3s ease-out both;
-                    animation-delay:{entries.index((icon,name,status,*detail))*0.1}s">
+                    animation-delay:{idx*0.1}s">
             <span style="font-size:18px">{icon}</span>
             <div style="flex:1">
                 <div style="font-weight:600;color:{color};font-size:14px">{name}</div>
-                <div style="font-size:12px;color:#666">{detail_text}</div>
+                <div style="font-size:12px;color:#666">{detail}</div>
             </div>
         </div>
         """)
 
-    # Resumen
     if ok == total and total > 0:
         summary_bg = "#E8F5E9"; summary_icon = "🎉"; summary_text = "¡Todos los archivos indexados!"
     elif ok > 0:
@@ -287,18 +277,14 @@ def render_log(entries):
     {summary_html}
     """
 
-
 # ══════════════════════════════════════
 # STATS PANEL
 # ══════════════════════════════════════
 def get_stats_html():
-    """Genera panel de estadísticas visual."""
     docs, count = get_indexed_docs()
     total_chars = sum(len(d.get('text_content', '')) for d in docs)
     last = stats.get("last_upload", "—")
-    session = stats.get("session_uploads", 0)
 
-    # Doc list
     doc_items = ""
     for d in sorted(docs, key=lambda x: x['doc_id']):
         name = d['doc_id']
@@ -321,52 +307,50 @@ def get_stats_html():
         doc_items = """
         <div style="text-align:center;padding:32px;color:#9E9E9E">
             <div style="font-size:36px;margin-bottom:8px">📂</div>
-            <div>No hay documentos indexados</div>
-            <div style="font-size:12px;margin-top:4px">Sube archivos en la pestaña 📤</div>
+            <div>No hay documentos</div>
+            <div style="font-size:12px;margin-top:4px">Sube archivos en 📤</div>
         </div>
         """
 
     return f"""
     <style>
-        @keyframes pulse {{ 0%,100%{{ opacity:1 }} 50%{{ opacity:.6 }} }}
-        @keyframes countUp {{ from{{ opacity:0;transform:translateY(8px) }} to{{ opacity:1;transform:translateY(0) }} }}
-        .stat-card {{
-            background: white; border-radius: 12px; padding: 14px 16px;
-            border: 1px solid #E2E8F0; text-align: center;
-            animation: countUp 0.4s ease-out both;
+        @keyframes countUp {{
+            from {{ opacity:0; transform:translateY(8px); }}
+            to {{ opacity:1; transform:translateY(0); }}
         }}
-        .stat-num {{ font-size: 28px; font-weight: 700; color: #1B5E7B; line-height: 1.2; }}
-        .stat-label {{ font-size: 11px; color: #5A6A7A; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }}
     </style>
-
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
-        <div class="stat-card" style="animation-delay:0s">
-            <div class="stat-num" style="color:#F96702">{count}</div>
-            <div class="stat-label">Documentos</div>
+        <div style="background:white;border-radius:12px;padding:14px 16px;
+                    border:1px solid #E2E8F0;text-align:center;
+                    animation:countUp 0.4s ease-out both">
+            <div style="font-size:28px;font-weight:700;color:#F96702;line-height:1.2">{count}</div>
+            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Documentos</div>
         </div>
-        <div class="stat-card" style="animation-delay:0.1s">
-            <div class="stat-num">{total_chars:,}</div>
-            <div class="stat-label">Caracteres</div>
+        <div style="background:white;border-radius:12px;padding:14px 16px;
+                    border:1px solid #E2E8F0;text-align:center;
+                    animation:countUp 0.4s ease-out both;animation-delay:0.1s">
+            <div style="font-size:28px;font-weight:700;color:#1B5E7B;line-height:1.2">{total_chars:,}</div>
+            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Caracteres</div>
         </div>
-        <div class="stat-card" style="animation-delay:0.2s">
-            <div class="stat-num" style="font-size:16px;padding-top:6px">{last}</div>
-            <div class="stat-label">Última carga</div>
+        <div style="background:white;border-radius:12px;padding:14px 16px;
+                    border:1px solid #E2E8F0;text-align:center;
+                    animation:countUp 0.4s ease-out both;animation-delay:0.2s">
+            <div style="font-size:16px;font-weight:700;color:#1B5E7B;padding-top:6px">{last}</div>
+            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Última carga</div>
         </div>
     </div>
-
     <div style="max-height:340px;overflow-y:auto;padding-right:4px">
         {doc_items}
     </div>
     """
 
 # ══════════════════════════════════════
-# RAG QUERY (CON "PENSANDO...")
+# RAG QUERY
 # ══════════════════════════════════════
 def chat_query(question, history):
     if not question.strip():
         return "", history, get_stats_html()
 
-    # Paso 1: Mostrar "pensando..."
     thinking_msg = "🔍 Buscando documentos relevantes..."
     history = history + [(question, thinking_msg)]
     yield "", history, get_stats_html()
@@ -396,11 +380,9 @@ def chat_query(question, history):
         context = hit.entity.get('text_content')
         score = hit.distance
 
-        # Paso 2: Actualizar a "generando respuesta..."
         history[-1] = (question, f"📄 Encontrado: *{doc_name}*\n\n🤖 Generando respuesta...")
         yield "", history, get_stats_html()
 
-        # Paso 3: Generar con LLM
         prompt = f"""<human>:{context}. Answer this question based on given context {question}
 <bot>:"""
         response = model_llm.get_llm_generation(
@@ -410,7 +392,6 @@ def chat_query(question, history):
             top_k=70, repetition_penalty=1.07
         )
 
-        # Paso 4: Mostrar respuesta final
         source_badge = f"\n\n---\n📎 **Fuente:** {doc_name} · Relevancia: {score:.0%}"
         history[-1] = (question, response + source_badge)
         yield "", history, get_stats_html()
@@ -419,6 +400,47 @@ def chat_query(question, history):
         history[-1] = (question, f"❌ Error: {str(e)}")
         yield "", history, get_stats_html()
 
+# ══════════════════════════════════════
+# CSS
+# ══════════════════════════════════════
+APP_CSS = """
+.header-box {
+    background: linear-gradient(135deg, #0D3D56 0%, #1B5E7B 50%, #2A8CB5 100%);
+    padding: 28px 32px; border-radius: 16px; margin-bottom: 16px;
+    box-shadow: 0 4px 24px rgba(13,61,86,0.18);
+    position: relative; overflow: hidden;
+}
+.header-box::before {
+    content: ''; position: absolute; top: -40%; right: -15%;
+    width: 300px; height: 300px; border-radius: 50%;
+    background: rgba(249,103,2,0.08);
+}
+.header-box h1 {
+    color: white !important; font-size: 28px !important;
+    margin: 0 0 6px !important; position: relative; z-index: 1;
+}
+.header-box p {
+    color: rgba(255,255,255,0.75) !important; font-size: 14px !important;
+    margin: 0 !important; position: relative; z-index: 1;
+}
+.accent { color: #F96702 !important; }
+.tab-nav { border-bottom: 2px solid #E2E8F0 !important; }
+.tab-nav button {
+    font-weight: 600 !important; font-size: 15px !important;
+    padding: 14px 22px !important; transition: all 0.2s !important;
+}
+.tab-nav button.selected {
+    border-bottom: 3px solid #F96702 !important; color: #1B5E7B !important;
+}
+.upload-zone {
+    border: 2px dashed #B0D8E8 !important; border-radius: 14px !important;
+    background: #F7FBFD !important; transition: all 0.3s !important;
+}
+.upload-zone:hover {
+    border-color: #F96702 !important; background: #FFF8F3 !important;
+}
+.footer { text-align:center; padding:20px; color:#9E9E9E; font-size:12px; }
+"""
 
 # ══════════════════════════════════════
 # GRADIO UI
@@ -426,86 +448,8 @@ def chat_query(question, history):
 def create_app():
     import gradio as gr
 
-    css = """
-    /* Header */
-    .header-box {
-        background: linear-gradient(135deg, #0D3D56 0%, #1B5E7B 50%, #2A8CB5 100%);
-        padding: 28px 32px; border-radius: 16px; margin-bottom: 16px;
-        box-shadow: 0 4px 24px rgba(13,61,86,0.18);
-        position: relative; overflow: hidden;
-    }
-    .header-box::before {
-        content: ''; position: absolute; top: -40%; right: -15%;
-        width: 300px; height: 300px; border-radius: 50%;
-        background: rgba(249,103,2,0.08);
-    }
-    .header-box h1 {
-        color: white !important; font-size: 28px !important;
-        margin: 0 0 6px !important; position: relative; z-index: 1;
-    }
-    .header-box p {
-        color: rgba(255,255,255,0.75) !important; font-size: 14px !important;
-        margin: 0 !important; position: relative; z-index: 1;
-    }
-    .accent { color: #F96702 !important; }
+    with gr.Blocks(title="RAG Chatbot | Cloudera AI") as app:
 
-    /* Tabs */
-    .tab-nav { border-bottom: 2px solid #E2E8F0 !important; }
-    .tab-nav button {
-        font-weight: 600 !important; font-size: 15px !important;
-        padding: 14px 22px !important; transition: all 0.2s !important;
-    }
-    .tab-nav button.selected {
-        border-bottom: 3px solid #F96702 !important;
-        color: #1B5E7B !important;
-    }
-
-    /* Upload */
-    .upload-zone {
-        border: 2px dashed #B0D8E8 !important; border-radius: 14px !important;
-        background: #F7FBFD !important; transition: all 0.3s !important;
-    }
-    .upload-zone:hover {
-        border-color: #F96702 !important; background: #FFF8F3 !important;
-        transform: translateY(-2px); box-shadow: 0 8px 24px rgba(249,103,2,0.1);
-    }
-
-    /* Chatbot */
-    .chatbot { border-radius: 14px !important; }
-    .chatbot .message.bot {
-        animation: msgIn 0.3s ease-out both;
-    }
-    @keyframes msgIn {
-        from { opacity: 0; transform: translateY(8px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-
-    /* Buttons */
-    .gr-button-primary {
-        background: linear-gradient(135deg, #F96702, #FF8534) !important;
-        border: none !important; border-radius: 12px !important;
-        font-weight: 600 !important; box-shadow: 0 4px 12px rgba(249,103,2,0.25) !important;
-        transition: all 0.2s !important;
-    }
-    .gr-button-primary:hover {
-        transform: translateY(-1px) !important;
-        box-shadow: 0 6px 20px rgba(249,103,2,0.35) !important;
-    }
-
-    /* Footer */
-    .footer { text-align:center; padding:20px; color:#9E9E9E; font-size:12px; }
-    """
-
-    with gr.Blocks(
-        title="RAG Chatbot | Cloudera AI",
-        theme=gr.themes.Soft(
-            primary_hue="orange", secondary_hue="blue",
-            font=gr.themes.GoogleFont("DM Sans"),
-        ),
-        css=css,
-    ) as app:
-
-        # Header
         gr.HTML("""
         <div class="header-box">
             <h1>💬 RAG Chatbot <span class="accent">| Cloudera AI</span></h1>
@@ -520,7 +464,6 @@ def create_app():
                     with gr.Column(scale=3):
                         chatbot = gr.Chatbot(
                             height=500, show_label=False,
-                            bubble_full_width=False,
                         )
                         with gr.Row():
                             msg = gr.Textbox(
@@ -533,7 +476,6 @@ def create_app():
                     with gr.Column(scale=1, min_width=280):
                         stats_panel = gr.HTML(
                             value="<div style='padding:20px;text-align:center;color:#999'>Cargando...</div>",
-                            label="",
                         )
                         refresh = gr.Button("🔄 Actualizar", size="sm")
 
@@ -626,20 +568,11 @@ def create_app():
         gr.HTML('<div class="footer">Cloudera Solutions Engineering · Powered by Open-Source AI · 2026</div>')
 
         # ═══ EVENTS ═══
-        send.click(
-            chat_query, [msg, chatbot], [msg, chatbot, stats_panel],
-        )
-        msg.submit(
-            chat_query, [msg, chatbot], [msg, chatbot, stats_panel],
-        )
-        clear.click(
-            lambda: ([], "", get_stats_html()),
-            outputs=[chatbot, msg, stats_panel],
-        )
-        upload_btn.click(
-            process_uploads, [files], [upload_log],
-        ).then(
-            lambda: get_stats_html(), outputs=[stats_panel],
+        send.click(chat_query, [msg, chatbot], [msg, chatbot, stats_panel])
+        msg.submit(chat_query, [msg, chatbot], [msg, chatbot, stats_panel])
+        clear.click(lambda: ([], "", get_stats_html()), outputs=[chatbot, msg, stats_panel])
+        upload_btn.click(process_uploads, [files], [upload_log]).then(
+            lambda: get_stats_html(), outputs=[stats_panel]
         )
         refresh.click(lambda: get_stats_html(), outputs=[stats_panel])
         app.load(lambda: get_stats_html(), outputs=[stats_panel])
@@ -650,6 +583,7 @@ def create_app():
 # MAIN
 # ══════════════════════════════════════
 if __name__ == "__main__":
+    import gradio as gr
     print("RAG Chatbot v4 iniciando...")
     start_milvus()
     ensure_collection()
@@ -659,4 +593,5 @@ if __name__ == "__main__":
         share=False, show_error=True,
         server_name='127.0.0.1',
         server_port=int(os.getenv('CDSW_APP_PORT', '8080')),
+        css=APP_CSS,
     )
