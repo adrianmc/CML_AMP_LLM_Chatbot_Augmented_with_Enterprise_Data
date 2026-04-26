@@ -1,15 +1,14 @@
 """
-llm_rag_app.py — RAG Chatbot v4
+llm_rag_app.py — RAG Chatbot v5
 Cloudera Machine Learning
 Compatible con Gradio 6.0+
 
-Features:
-  - Barra de progreso por archivo durante indexación
-  - Animaciones CSS (spinners, pulsos, transiciones)
-  - Panel de estadísticas (docs, chars, última carga)
-  - Indicador "pensando..." animado mientras el LLM genera
-  - Texto almacenado en Milvus (sin acceso a disco al consultar)
-  - Auto-install + fallbacks para PDF
+v5 mejoras sobre v4:
+  - Chunking: documentos divididos en fragmentos de 400 chars con overlap
+  - Top-K retrieval: recupera 3 chunks relevantes en vez de 1 documento
+  - Prompt estructurado: instrucciones claras al LLM
+  - Fallback: si respuesta vacía, muestra el contexto encontrado
+  - Stats: muestra docs únicos vs chunks totales
 """
 import os
 import sys
@@ -53,9 +52,12 @@ import utils.model_embedding_utils as model_embedding
 # ══════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════
-COLLECTION = 'rag_documents'
+COLLECTION = 'rag_chunks_v5'
 MILVUS_DIR = 'milvus-data'
-MAX_TEXT = 1500
+CHUNK_SIZE = 400       # Caracteres por chunk
+CHUNK_OVERLAP = 80     # Solapamiento entre chunks
+TOP_K = 3              # Chunks a recuperar por pregunta
+MAX_CONTEXT = 1200     # Máx chars de contexto combinado al LLM
 EMB_DIM = 384
 
 stats = {
@@ -84,10 +86,12 @@ def ensure_collection():
     if utility.has_collection(COLLECTION):
         return Collection(COLLECTION)
     fields = [
-        FieldSchema(name='doc_id', dtype=DataType.VARCHAR,
-                     max_length=500, is_primary=True, auto_id=False),
+        FieldSchema(name='chunk_id', dtype=DataType.INT64,
+                     is_primary=True, auto_id=True),
+        FieldSchema(name='source_name', dtype=DataType.VARCHAR,
+                     max_length=500),
         FieldSchema(name='text_content', dtype=DataType.VARCHAR,
-                     max_length=2000),
+                     max_length=600),
         FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR,
                      dim=EMB_DIM),
     ]
@@ -105,12 +109,64 @@ def get_indexed_docs():
         col = Collection(COLLECTION)
         col.load()
         count = col.num_entities
-        res = col.query(expr="doc_id != ''",
-                        output_fields=['doc_id', 'text_content'], limit=200)
+        res = col.query(expr="chunk_id >= 0",
+                        output_fields=['source_name', 'text_content'], limit=500)
         col.release()
         return res, count
     except:
         return [], 0
+
+def get_doc_names():
+    """Retorna lista de nombres únicos de documentos para el dropdown."""
+    docs, _ = get_indexed_docs()
+    names = sorted(set(d.get('source_name', '') for d in docs))
+    return names if names else ["(sin documentos)"]
+
+def delete_document(doc_name):
+    """Elimina todos los chunks de un documento específico."""
+    import gradio as gr
+
+    if not doc_name or doc_name == "(sin documentos)":
+        return (
+            render_log([("⚠️", "Selecciona un documento", "warn", "")]),
+            gr.update(choices=get_doc_names())
+        )
+
+    try:
+        col = Collection(COLLECTION)
+        col.load()
+
+        # Buscar chunks de este documento
+        chunks = col.query(
+            expr=f'source_name == "{doc_name}"',
+            output_fields=['chunk_id'],
+            limit=500
+        )
+
+        if not chunks:
+            col.release()
+            return (
+                render_log([("⚠️", doc_name, "warn", "No encontrado")]),
+                gr.update(choices=get_doc_names())
+            )
+
+        # Eliminar por IDs
+        chunk_ids = [c['chunk_id'] for c in chunks]
+        col.delete(expr=f"chunk_id in {chunk_ids}")
+        col.flush()
+        col.release()
+
+        n = len(chunk_ids)
+        return (
+            render_log([("🗑️", doc_name, "ok", f"Eliminado ({n} chunks)")]),
+            gr.update(choices=get_doc_names(), value=None)
+        )
+
+    except Exception as e:
+        return (
+            render_log([("❌", doc_name, "error", str(e)[:80])]),
+            gr.update(choices=get_doc_names())
+        )
 
 # ══════════════════════════════════════
 # TEXT EXTRACTION (BULLETPROOF)
@@ -123,7 +179,29 @@ def clean_text(text):
     text = ''.join(c for c in text if c.isprintable() or c in '\n\t ')
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
-    return text.strip()[:MAX_TEXT]
+    return text.strip()
+
+def split_into_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Divide texto en chunks con solapamiento para mejor retrieval."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        # Intentar cortar en un punto natural (punto, salto de línea)
+        if end < len(text):
+            # Buscar el último punto o salto de línea en el chunk
+            last_break = max(chunk.rfind('. '), chunk.rfind('\n'), chunk.rfind('? '), chunk.rfind('! '))
+            if last_break > chunk_size * 0.5:  # Solo si está en la segunda mitad
+                chunk = chunk[:last_break + 1]
+                end = start + last_break + 1
+        chunk = chunk.strip()
+        if chunk and len(chunk) > 20:
+            chunks.append(chunk)
+        start = end - overlap
+    return chunks
 
 def extract_pdf(path):
     if PDFMINER_OK:
@@ -191,23 +269,35 @@ def process_uploads(files, progress=None):
             continue
 
         try:
-            text = extract_text_from_file(path)
-            if not text.strip() or len(text.strip()) < 10:
+            full_text = extract_text_from_file(path)
+            if not full_text.strip() or len(full_text.strip()) < 10:
                 entries.append(("⚠️", name, "warn", "Sin texto extraíble"))
                 continue
 
-            embedding = model_embedding.get_embeddings(text)
+            # Dividir en chunks
+            chunks = split_into_chunks(full_text)
+
+            # Generar embeddings e insertar cada chunk
+            source_names = []
+            text_contents = []
+            embeddings = []
+
+            for chunk in chunks:
+                emb = model_embedding.get_embeddings(chunk)
+                source_names.append(name)
+                text_contents.append(chunk[:580])  # Límite del campo VARCHAR
+                embeddings.append(emb)
 
             col = Collection(COLLECTION)
-            col.insert([[name], [text], [embedding]])
+            col.insert([source_names, text_contents, embeddings])
             col.flush()
 
-            chars = len(text)
-            stats["total_chars"] += chars
+            total_chars = sum(len(c) for c in chunks)
+            stats["total_chars"] += total_chars
             stats["session_uploads"] += 1
             stats["last_upload"] = datetime.now().strftime("%H:%M:%S")
 
-            entries.append(("✅", name, "ok", f"{chars} caracteres"))
+            entries.append(("✅", name, "ok", f"{len(chunks)} chunks · {total_chars} chars"))
 
         except Exception as e:
             entries.append(("❌", name, "error", str(e)[:80]))
@@ -285,10 +375,19 @@ def get_stats_html():
     total_chars = sum(len(d.get('text_content', '')) for d in docs)
     last = stats.get("last_upload", "—")
 
+    # Contar documentos únicos vs chunks
+    unique_docs = set(d.get('source_name', '') for d in docs)
+    n_docs = len(unique_docs)
+
+    # Doc list agrupado
     doc_items = ""
-    for d in sorted(docs, key=lambda x: x['doc_id']):
-        name = d['doc_id']
-        chars = len(d.get('text_content', ''))
+    doc_chunks = {}
+    for d in docs:
+        src = d.get('source_name', '?')
+        doc_chunks[src] = doc_chunks.get(src, 0) + 1
+
+    for name in sorted(doc_chunks.keys()):
+        n_chunks = doc_chunks[name]
         icon = "📄" if name.lower().endswith('.pdf') else "📝"
         doc_items += f"""
         <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;
@@ -299,7 +398,7 @@ def get_stats_html():
              onmouseout="this.style.background='#F7F9FB';this.style.borderColor='#E2E8F0'">
             <span>{icon}</span>
             <span style="flex:1;font-weight:500;color:#1A2332">{name}</span>
-            <span style="color:#5A6A7A;font-size:11px">{chars} chars</span>
+            <span style="color:#5A6A7A;font-size:11px">{n_chunks} chunks</span>
         </div>
         """
 
@@ -319,24 +418,30 @@ def get_stats_html():
             to {{ opacity:1; transform:translateY(0); }}
         }}
     </style>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
-        <div style="background:white;border-radius:12px;padding:14px 16px;
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px">
+        <div style="background:white;border-radius:12px;padding:12px;
                     border:1px solid #E2E8F0;text-align:center;
                     animation:countUp 0.4s ease-out both">
-            <div style="font-size:28px;font-weight:700;color:#F96702;line-height:1.2">{count}</div>
-            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Documentos</div>
+            <div style="font-size:24px;font-weight:700;color:#F96702;line-height:1.2">{n_docs}</div>
+            <div style="font-size:10px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Docs</div>
         </div>
-        <div style="background:white;border-radius:12px;padding:14px 16px;
+        <div style="background:white;border-radius:12px;padding:12px;
                     border:1px solid #E2E8F0;text-align:center;
                     animation:countUp 0.4s ease-out both;animation-delay:0.1s">
-            <div style="font-size:28px;font-weight:700;color:#1B5E7B;line-height:1.2">{total_chars:,}</div>
-            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Caracteres</div>
+            <div style="font-size:24px;font-weight:700;color:#1B5E7B;line-height:1.2">{count}</div>
+            <div style="font-size:10px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Chunks</div>
         </div>
-        <div style="background:white;border-radius:12px;padding:14px 16px;
+        <div style="background:white;border-radius:12px;padding:12px;
+                    border:1px solid #E2E8F0;text-align:center;
+                    animation:countUp 0.4s ease-out both;animation-delay:0.15s">
+            <div style="font-size:24px;font-weight:700;color:#1B5E7B;line-height:1.2">{total_chars:,}</div>
+            <div style="font-size:10px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Chars</div>
+        </div>
+        <div style="background:white;border-radius:12px;padding:12px;
                     border:1px solid #E2E8F0;text-align:center;
                     animation:countUp 0.4s ease-out both;animation-delay:0.2s">
-            <div style="font-size:16px;font-weight:700;color:#1B5E7B;padding-top:6px">{last}</div>
-            <div style="font-size:11px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Última carga</div>
+            <div style="font-size:14px;font-weight:700;color:#1B5E7B;padding-top:4px">{last}</div>
+            <div style="font-size:10px;color:#5A6A7A;text-transform:uppercase;letter-spacing:0.05em;margin-top:2px">Última</div>
         </div>
     </div>
     <div style="max-height:340px;overflow-y:auto;padding-right:4px">
@@ -351,7 +456,7 @@ def chat_query(question, history):
     if not question.strip():
         return "", history, get_stats_html()
 
-    thinking_msg = "🔍 Buscando documentos relevantes..."
+    thinking_msg = "🔍 Buscando fragmentos relevantes..."
     history = history + [
         {"role": "user", "content": question},
         {"role": "assistant", "content": thinking_msg},
@@ -367,8 +472,8 @@ def chat_query(question, history):
             data=[q_emb],
             anns_field="embedding",
             param={"metric_type": "IP", "params": {"nprobe": 10}},
-            limit=1,
-            output_fields=['doc_id', 'text_content'],
+            limit=TOP_K,
+            output_fields=['source_name', 'text_content'],
             consistency_level="Strong"
         )
         col.release()
@@ -378,16 +483,36 @@ def chat_query(question, history):
             yield "", history, get_stats_html()
             return
 
-        hit = results[0][0]
-        doc_name = hit.entity.get('doc_id')
-        context = hit.entity.get('text_content')
-        score = hit.distance
+        # Combinar top-K chunks como contexto
+        context_parts = []
+        sources = set()
+        best_score = 0
+        for hit in results[0]:
+            src = hit.entity.get('source_name', '?')
+            txt = hit.entity.get('text_content', '')
+            score = hit.distance
+            if score > best_score:
+                best_score = score
+            sources.add(src)
+            context_parts.append(txt)
 
-        history[-1] = {"role": "assistant", "content": f"📄 Encontrado: *{doc_name}*\n\n🤖 Generando respuesta..."}
+        combined_context = "\n\n".join(context_parts)[:MAX_CONTEXT]
+        source_list = ", ".join(sources)
+
+        history[-1] = {"role": "assistant", "content": f"📄 Encontrado en: *{source_list}* ({len(context_parts)} fragmentos)\n\n🤖 Generando respuesta..."}
         yield "", history, get_stats_html()
 
-        prompt = f"""<human>:{context}. Answer this question based on given context {question}
+        # Prompt mejorado y estructurado
+        prompt = f"""<human>: You are a helpful assistant. Use ONLY the following context to answer the question. If the context does not contain enough information, say so clearly. Answer in the same language as the question.
+
+CONTEXT:
+{combined_context}
+
+QUESTION: {question}
+
+Provide a clear, specific answer based only on the context above.
 <bot>:"""
+
         response = model_llm.get_llm_generation(
             prompt, ['<human>:', '\n<bot>:'],
             max_new_tokens=256, do_sample=False,
@@ -395,7 +520,12 @@ def chat_query(question, history):
             top_k=70, repetition_penalty=1.07
         )
 
-        source_badge = f"\n\n---\n📎 **Fuente:** {doc_name} · Relevancia: {score:.0%}"
+        # Validar respuesta
+        response = response.strip()
+        if not response or len(response) < 5:
+            response = f"No pude generar una respuesta clara. El contexto encontrado fue:\n\n> {combined_context[:300]}..."
+
+        source_badge = f"\n\n---\n📎 **Fuentes:** {source_list} · {len(context_parts)} fragmentos · Relevancia: {best_score:.0%}"
         history[-1] = {"role": "assistant", "content": response + source_badge}
         yield "", history, get_stats_html()
 
@@ -523,6 +653,23 @@ def create_app():
                             """,
                         )
 
+                gr.Markdown("---")
+
+                # Sección de eliminación
+                gr.Markdown("### 🗑️ Eliminar Documentos")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        doc_dropdown = gr.Dropdown(
+                            label="Seleccionar documento a eliminar",
+                            choices=get_doc_names(),
+                            interactive=True,
+                        )
+                    with gr.Column(scale=1):
+                        delete_btn = gr.Button(
+                            "🗑️ Eliminar documento",
+                            variant="stop", size="lg",
+                        )
+
                 gr.Markdown("""
                 ---
                 **Formatos:** PDF, TXT, MD · **Máx recomendado:** 10 MB por archivo ·
@@ -539,11 +686,11 @@ def create_app():
                 ```
                 📄 Documento (PDF/TXT)
                   ↓ pdfminer → pypdf → raw (3 fallbacks)
-                📝 Texto extraído
-                  ↓ Limpiar UTF-8 + truncar a 1500 chars
-                🔢 Embedding (all-MiniLM-L6-v2, 384-dim)
+                📝 Texto completo extraído + limpieza UTF-8
+                  ↓ Dividir en chunks de 400 chars con 80 de overlap
+                🔢 Embedding por cada chunk (all-MiniLM-L6-v2, 384-dim)
                   ↓
-                🗄️ Milvus: guarda texto + vector juntos
+                🗄️ Milvus: cada chunk = 1 registro (source + texto + vector)
                 ```
 
                 **Al hacer una pregunta:**
@@ -551,22 +698,22 @@ def create_app():
                 ```
                 ❓ Pregunta
                   ↓ Embedding
-                🔍 Búsqueda en Milvus
-                  ↓ Texto directo (sin leer disco)
-                🤖 LLM + contexto → Respuesta
+                🔍 Buscar top 3 chunks más similares en Milvus
+                  ↓ Combinar texto de los 3 chunks (máx 1200 chars)
+                🤖 Prompt estructurado + contexto combinado → LLM → Respuesta
                 ```
 
                 ---
 
-                ### ¿Por qué es robusto?
+                ### Mejoras de accuracy (v5 vs v4)
 
-                | Problema | Solución |
+                | Antes (v4) | Ahora (v5) |
                 |---|---|
-                | pdfminer no instalado | Auto-instala + 2 fallbacks |
-                | Bytes UTF-8 inválidos | Limpieza al ingestar |
-                | CUDA out of memory | Truncado a 1500 chars |
-                | Archivo borrado después de indexar | Texto vive en Milvus |
-                | Interfaz se congela | Progreso visual por archivo |
+                | 1 embedding por documento entero | 1 embedding por chunk de 400 chars |
+                | Recupera 1 solo documento | Recupera top 3 chunks más relevantes |
+                | Contexto = primeros 1500 chars (portada + índice) | Contexto = las 3 secciones más relevantes |
+                | Prompt simple sin instrucciones | Prompt estructurado con instrucciones claras |
+                | Respuesta vacía = silencio | Respuesta vacía = muestra el contexto encontrado |
                 """)
 
         gr.HTML('<div class="footer">Cloudera Solutions Engineering · Powered by Open-Source AI · 2026</div>')
@@ -575,9 +722,23 @@ def create_app():
         send.click(chat_query, [msg, chatbot], [msg, chatbot, stats_panel])
         msg.submit(chat_query, [msg, chatbot], [msg, chatbot, stats_panel])
         clear.click(lambda: ([], "", get_stats_html()), outputs=[chatbot, msg, stats_panel])
-        upload_btn.click(process_uploads, [files], [upload_log]).then(
+
+        # Upload → refresh stats + dropdown
+        upload_btn.click(
+            process_uploads, [files], [upload_log]
+        ).then(
+            lambda: get_stats_html(), outputs=[stats_panel]
+        ).then(
+            lambda: gr.update(choices=get_doc_names()), outputs=[doc_dropdown]
+        )
+
+        # Delete → refresh stats + dropdown + log
+        delete_btn.click(
+            delete_document, [doc_dropdown], [upload_log, doc_dropdown]
+        ).then(
             lambda: get_stats_html(), outputs=[stats_panel]
         )
+
         refresh.click(lambda: get_stats_html(), outputs=[stats_panel])
         app.load(lambda: get_stats_html(), outputs=[stats_panel])
 
@@ -588,7 +749,7 @@ def create_app():
 # ══════════════════════════════════════
 if __name__ == "__main__":
     import gradio as gr
-    print("RAG Chatbot v4 iniciando...")
+    print("RAG Chatbot v5 iniciando...")
     start_milvus()
     ensure_collection()
     print("Milvus listo")
