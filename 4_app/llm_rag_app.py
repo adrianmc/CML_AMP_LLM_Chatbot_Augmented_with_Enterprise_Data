@@ -488,8 +488,8 @@ def chat_query(question, history):
         sources = set()
         best_score = 0
         for hit in results[0]:
-            src = hit.entity.get('source_name', '?')
-            txt = hit.entity.get('text_content', '')
+            src = hit.entity.get('source_name')
+            txt = hit.entity.get('text_content')
             score = hit.distance
             if score > best_score:
                 best_score = score
