@@ -1,14 +1,15 @@
 """
-llm_rag_app.py — RAG Chatbot v5
+llm_rag_app.py — RAG Chatbot v5 + Mistral
 Cloudera Machine Learning
 Compatible con Gradio 6.0+
 
-v5 mejoras sobre v4:
+v5 + Mistral:
+  - LLM: Mistral-7B-Instruct-v0.2 con 4-bit quantization (~5GB VRAM)
   - Chunking: documentos divididos en fragmentos de 400 chars con overlap
-  - Top-K retrieval: recupera 3 chunks relevantes en vez de 1 documento
-  - Prompt estructurado: instrucciones claras al LLM
-  - Fallback: si respuesta vacía, muestra el contexto encontrado
-  - Stats: muestra docs únicos vs chunks totales
+  - Top-3 retrieval: recupera 3 chunks relevantes
+  - Prompt en español con instrucciones claras
+  - Fallback si respuesta vacía
+  - Auto-instala dependencias (pdfminer, bitsandbytes, accelerate)
 """
 import os
 import sys
@@ -35,6 +36,20 @@ def ensure_pdfminer():
 
 PDFMINER_OK = ensure_pdfminer()
 
+def ensure_llm_deps():
+    """Instala dependencias para Mistral-7B con 4-bit quantization."""
+    deps = ['bitsandbytes', 'accelerate']
+    for dep in deps:
+        try:
+            __import__(dep)
+        except ImportError:
+            print(f"Instalando {dep}...")
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', dep, '-q']
+            )
+
+ensure_llm_deps()
+
 # ══════════════════════════════════════
 # PATHS
 # ══════════════════════════════════════
@@ -46,8 +61,70 @@ from pymilvus import (
     connections, Collection, utility,
     FieldSchema, CollectionSchema, DataType
 )
-import utils.model_llm_utils as model_llm
 import utils.model_embedding_utils as model_embedding
+
+# ══════════════════════════════════════
+# MISTRAL-7B LLM
+# ══════════════════════════════════════
+LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
+llm_model = None
+llm_tokenizer = None
+
+def load_llm():
+    """Carga Mistral-7B-Instruct con 4-bit quantization en GPU."""
+    global llm_model, llm_tokenizer
+    if llm_model is not None:
+        return
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    print(f"Cargando {LLM_MODEL_NAME} (4-bit)...")
+    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    print("Mistral-7B listo")
+
+
+def generate_response(context: str, question: str) -> str:
+    """Genera respuesta usando Mistral-7B-Instruct."""
+    import torch
+    load_llm()
+
+    prompt = f"""[INST] Eres un asistente experto. Responde la pregunta usando ÚNICAMENTE el contexto proporcionado. Si el contexto no contiene suficiente información, dilo claramente. Responde en el mismo idioma que la pregunta. Sé específico y conciso.
+
+CONTEXTO:
+{context}
+
+PREGUNTA: {question} [/INST]"""
+
+    inputs = llm_tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+
+    with torch.no_grad():
+        output = llm_model.generate(
+            **inputs,
+            max_new_tokens=300,
+            do_sample=False,
+            pad_token_id=llm_tokenizer.eos_token_id,
+        )
+
+    # Decodificar solo tokens nuevos
+    response = llm_tokenizer.decode(
+        output[0][inputs['input_ids'].shape[1]:],
+        skip_special_tokens=True
+    )
+    return response.strip()
 
 # ══════════════════════════════════════
 # CONFIG
@@ -502,23 +579,8 @@ def chat_query(question, history):
         history[-1] = {"role": "assistant", "content": f"📄 Encontrado en: *{source_list}* ({len(context_parts)} fragmentos)\n\n🤖 Generando respuesta..."}
         yield "", history, get_stats_html()
 
-        # Prompt mejorado y estructurado
-        prompt = f"""<human>: You are a helpful assistant. Use ONLY the following context to answer the question. If the context does not contain enough information, say so clearly. Answer in the same language as the question.
-
-CONTEXT:
-{combined_context}
-
-QUESTION: {question}
-
-Provide a clear, specific answer based only on the context above.
-<bot>:"""
-
-        response = model_llm.get_llm_generation(
-            prompt, ['<human>:', '\n<bot>:'],
-            max_new_tokens=256, do_sample=False,
-            temperature=0.7, top_p=0.85,
-            top_k=70, repetition_penalty=1.07
-        )
+        # Generar respuesta con Mistral-7B
+        response = generate_response(combined_context, question)
 
         # Validar respuesta
         response = response.strip()
@@ -586,7 +648,7 @@ def create_app():
         gr.HTML("""
         <div class="header-box">
             <h1>💬 RAG Chatbot <span class="accent">| Cloudera AI</span></h1>
-            <p>Sube documentos · Haz preguntas · Obtén respuestas inteligentes</p>
+            <p>Sube documentos · Haz preguntas · Powered by Mistral-7B</p>
         </div>
         """)
 
@@ -700,20 +762,21 @@ def create_app():
                   ↓ Embedding
                 🔍 Buscar top 3 chunks más similares en Milvus
                   ↓ Combinar texto de los 3 chunks (máx 1200 chars)
-                🤖 Prompt estructurado + contexto combinado → LLM → Respuesta
+                🤖 Mistral-7B-Instruct (4-bit) + prompt español → Respuesta
                 ```
 
                 ---
 
-                ### Mejoras de accuracy (v5 vs v4)
+                ### Componentes
 
-                | Antes (v4) | Ahora (v5) |
+                | Componente | Tecnología |
                 |---|---|
-                | 1 embedding por documento entero | 1 embedding por chunk de 400 chars |
-                | Recupera 1 solo documento | Recupera top 3 chunks más relevantes |
-                | Contexto = primeros 1500 chars (portada + índice) | Contexto = las 3 secciones más relevantes |
-                | Prompt simple sin instrucciones | Prompt estructurado con instrucciones claras |
-                | Respuesta vacía = silencio | Respuesta vacía = muestra el contexto encontrado |
+                | LLM | Mistral-7B-Instruct-v0.2 (4-bit quantization) |
+                | Embeddings | all-MiniLM-L6-v2 (384-dim) |
+                | Vector Store | Milvus (integrado) |
+                | Chunking | 400 chars, 80 overlap, corte en punto natural |
+                | Retrieval | Top-3 chunks por similitud coseno |
+                | GPU | NVIDIA T4 (~5GB modelo + ~100MB embeddings) |
                 """)
 
         gr.HTML('<div class="footer">Cloudera Solutions Engineering · Powered by Open-Source AI · 2026</div>')
@@ -749,10 +812,15 @@ def create_app():
 # ══════════════════════════════════════
 if __name__ == "__main__":
     import gradio as gr
-    print("RAG Chatbot v5 iniciando...")
+    print("RAG Chatbot v5 + Mistral iniciando...")
     start_milvus()
     ensure_collection()
     print("Milvus listo")
+
+    # Pre-cargar modelo LLM al inicio
+    print("Cargando Mistral-7B-Instruct...")
+    load_llm()
+
     app = create_app()
     app.queue().launch(
         share=False, show_error=True,
